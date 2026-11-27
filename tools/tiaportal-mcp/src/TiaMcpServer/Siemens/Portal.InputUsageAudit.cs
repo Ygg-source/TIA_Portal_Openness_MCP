@@ -31,6 +31,7 @@ namespace TiaMcpServer.Siemens
             internal int Number;
             internal string? Unit;
             internal string? InstanceOf;
+            internal ILookup<string, string>? PinDirections;
             internal PlcInputProgramKind Kind;
         }
 
@@ -224,6 +225,7 @@ namespace TiaMcpServer.Siemens
                 .Where(x => x.Reference.ConfirmedUsage && !x.Reference.Absolute)
                 .ToLookup(x => (x.Reference.BlockPath, x.Point.Name!.ToUpperInvariant()));
             var untagged = new Dictionary<PlcInputSpan, PlcInputAuditPoint>();
+            var callReferences = new List<(PlcInputAuditReference Reference, bool ResolveAccess)>();
             var temp = Path.Combine(Path.GetTempPath(), "tia-input-audit-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(temp);
             var file = new FileInfo(Path.Combine(temp, "block.xml"));
@@ -243,7 +245,9 @@ namespace TiaMcpServer.Siemens
                         block.Export(file, ExportOptions.None);
                         var issues = new List<string>();
                         var graphIssues = new List<string>();
-                        var matches = PlcInputSimaticMl.Scan(XDocument.Load(file.FullName), issues, graphIssues, graph);
+                        var xml = XDocument.Load(file.FullName);
+                        var matches = PlcInputSimaticMl.Scan(xml, issues, graphIssues, graph);
+                        if (metadata.Type is "FB" or "FC") metadata.PinDirections = PlcInputSimaticMl.ReadPinDirections(xml);
                         xmlScanned++;
                         if (graph) graphScanned++;
                         if (graphIssues.Count > 0)
@@ -316,10 +320,10 @@ namespace TiaMcpServer.Siemens
                                 GraphRegion = match.GraphRegion, GraphSequence = match.GraphSequence,
                                 TransitionName = match.TransitionName, TransitionNumber = match.TransitionNumber,
                             };
-                            foreach (var pin in match.Pins)
+                            if (match.Pins.Count != 0)
                             {
-                                ResolveInputCallPin(pin, codeTargets, qualifiedTargets, instanceTargets);
-                                reference.CallPins.Add(pin);
+                                reference.CallPins.AddRange(match.Pins);
+                                callReferences.Add((reference, match.Access == "Unknown"));
                             }
                             foreach (var owner in owners) owner.References.Add(reference);
                         }
@@ -339,6 +343,13 @@ namespace TiaMcpServer.Siemens
             finally
             {
                 Directory.Delete(temp);
+            }
+            foreach (var (reference, resolveAccess) in callReferences)
+            {
+                foreach (var pin in reference.CallPins)
+                    ResolveInputCallPin(pin, codeTargets, qualifiedTargets, instanceTargets);
+                if (resolveAccess && reference.CallPins.Count == 1 && reference.CallPins[0].Confirmed)
+                    reference.Access = PlcInputSimaticMl.SectionAccess(reference.CallPins[0].Direction);
             }
 
             var cpuModel = ReadInputAuditCpuAttribute(cpu, "TypeName", warnings);
@@ -467,6 +478,11 @@ namespace TiaMcpServer.Siemens
             if (candidates.Count != 1) return;
             pin.BlockName = candidates[0].Name;
             pin.BlockNumber = candidates[0].Number;
+            if (pin.Direction == null && pin.Pin != null && candidates[0].PinDirections is { } directions)
+            {
+                var sections = directions[pin.Pin].ToList();
+                if (sections.Count == 1) pin.Direction = sections[0];
+            }
         }
 
         private static void ReadNativeInputReferences(PlcTag tag, PlcInputAuditPoint point, string plcName,

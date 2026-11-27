@@ -189,6 +189,8 @@ namespace TiaMcpServer.Siemens
                         && parameter.Parent is XElement call && Is(call, "CallInfo"))
                     {
                         var direction = (string?)parameter.Attribute("Section");
+                        if (direction == null && parameter.Elements().Any(e => Token(e) == "=>"))
+                            direction = "Output";
                         if (use.Access == "Unknown") use.Access = SectionAccess(direction);
                         use.Pins.Add(CallPin(call, (string?)parameter.Attribute("Name"), direction, (string?)call.Attribute("UId")));
                     }
@@ -288,14 +290,28 @@ namespace TiaMcpServer.Siemens
             }
             return new PlcInputCallPin
             {
-                BlockType = (string?)call?.Attribute("BlockType"), BlockName = (string?)call?.Attribute("Name"),
+                BlockType = (string?)call?.Attribute("BlockType"),
+                BlockName = (string?)call?.Attribute("Name") ??
+                    ((string?)call?.Attribute("BlockType") == "FC" && scope == "GlobalVariable" && components.Length == 1
+                        ? components[0] : null),
                 CallUid = callUid, Pin = pin, Direction = section,
                 InstanceScope = scope, InstanceName = instance == null ? null : string.Join(".", components),
                 InstanceKind = kind, InstanceTypeName = declaredType,
             };
         }
 
-        private static string SectionAccess(string? section) => section switch
+        internal static ILookup<string, string> ReadPinDirections(XDocument xml)
+        {
+            var block = xml.Descendants().FirstOrDefault(e => e.Name.LocalName is "SW.Blocks.FB" or "SW.Blocks.FC");
+            var sections = Child(Child(Child(block, "AttributeList"), "Interface"), "Sections");
+            return (sections?.Elements().Where(e => Is(e, "Section")) ?? Enumerable.Empty<XElement>())
+                .SelectMany(s => s.Elements().Where(m => Is(m, "Member") && m.Attribute("Name") != null)
+                    .Select(m => (Name: (string)m.Attribute("Name")!, Direction: (string?)s.Attribute("Name"))))
+                .Where(p => p.Direction is "Input" or "InOut" or "Output" or "Return")
+                .ToLookup(p => p.Name, p => p.Direction!, StringComparer.OrdinalIgnoreCase);
+        }
+
+        internal static string SectionAccess(string? section) => section switch
         {
             "Input" => "Read", "Output" or "Return" => "Write", "InOut" => "RW", _ => "Unknown"
         };

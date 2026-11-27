@@ -166,6 +166,26 @@ namespace TiaMcpServer.Tests
             try { AuditRules("OB", 0, null); }
             catch (ArgumentException) { invalid = true; }
             check(invalid, "I audit: enabled call-pin rule rejects missing or invalid target parameters");
+
+            const string scl = """
+                <StructuredText><Access Scope="Call"><CallInfo BlockType="FC">
+                  <Instance Scope="GlobalVariable"><Component Name="DeviceStatus"/></Instance><Token Text="("/>
+                  <Parameter Name="value"><Token Text="=&gt;"/>
+                    <Access Scope="Address"><Address Area="Input" Type="Bool" BitOffset="1"/></Access>
+                  </Parameter><Token Text=")"/>
+                </CallInfo></Access><Token Text=";"/></StructuredText>
+                """;
+            var sclUse = PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit(scl) + "</Document>"), issues).Single();
+            check(sclUse.Confirmed && sclUse.Span.Canonical == "%I0.1" && sclUse.Access == "Write"
+                && sclUse.Pins.Single().Direction == "Output" && sclUse.Pins.Single().BlockName == "DeviceStatus",
+                "I audit: direct SCL output to an absolute input with a V20 FC call encoded as Instance");
+            var callee = XDocument.Parse("""
+                <Document><SW.Blocks.FC><AttributeList><Interface><Sections>
+                  <Section Name="InOut"><Member Name="value" Datatype="Bool"/></Section>
+                </Sections></Interface></AttributeList></SW.Blocks.FC></Document>
+                """);
+            check(PlcInputSimaticMl.ReadPinDirections(callee)["value"].Single() == "InOut",
+                "I audit: use callee interface to distinguish SCL InOut from Input when the parameter carries no Section");
         }
 
         private static void CheckGraph(Action<bool, string> check)
@@ -235,7 +255,8 @@ namespace TiaMcpServer.Tests
             check(report["checkedInputCount"]!.GetValue<int>() == 2 && report["failCount"]!.GetValue<int>() == 1
                 && report["unconfirmedCount"]!.GetValue<int>() == 1 && report["safetyOnlyExcludedCount"]!.GetValue<int>() == 1
                 && report["ruleViolationCounts"]!["caller"]!.GetValue<int>() == 1 && report["ruleViolationCounts"]!["graphDirectUse"]!.GetValue<int>() == 1
-                && Row(report, "SafetyOnly")["complete"]!.GetValue<bool>(), "I audit: mutually exclusive counts and safety-only exclusion");
+                && Row(report, "SafetyOnly")["complete"]!.GetValue<bool>() && Row(report, "SafetyOnly")["safetyOnlyExcluded"]!.GetValue<bool>()
+                && Status(Row(report, "SafetyOnly")) == "UNUSED", "I audit: exclusive safety-only count with the legacy row status");
             used.ReferencesComplete = false;
             report = Report(audit, used);
             check(report["failCount"]!.GetValue<int>() == 1 && report["unconfirmedCount"]!.GetValue<int>() == 0
