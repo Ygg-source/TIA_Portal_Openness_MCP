@@ -84,11 +84,11 @@
     }
   },
   "capabilities": {
-    "mcpToolCount": 238,
+    "mcpToolCount": 239,
     "mcpToolLayers": {
-      "L0": 9,
-      "L1": 38,
-      "L2": 164
+      "L0": 10,
+      "L1": 49,
+      "L2": 180
     },
     "newToolsThisRelease": [
       "HealthCheck (v2.4.0)",

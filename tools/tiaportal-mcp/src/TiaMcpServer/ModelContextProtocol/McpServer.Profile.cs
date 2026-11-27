@@ -56,7 +56,7 @@ namespace TiaMcpServer.ModelContextProtocol
             // instructions; tag tables and cross-references are what a model needs to read a
             // project it did not write.
             "ImportBlocksFromDocuments", "ExportBlocksAsDocuments",
-            "GetPlcTagTables", "GetCrossReferences",
+            "GetPlcTagTables", "GetCrossReferences", "AuditPlcInputUsage",
             "GetBlocks", "GetBlocksWithHierarchy", "GetBlockInfo",
             "ExportAsDocuments", "GoOffline",
             // 大响应寄存与分页。**任何档都必须能翻页** —— 超过阈值的响应会被寄存，

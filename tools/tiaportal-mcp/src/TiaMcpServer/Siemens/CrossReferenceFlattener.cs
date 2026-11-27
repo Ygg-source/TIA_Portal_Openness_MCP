@@ -36,9 +36,10 @@ namespace TiaMcpServer.Siemens
         /// <param name="truncation">null = the walk completed; otherwise why the list is partial.</param>
         /// <param name="unreadBranches">hierarchy paths ("DB_HMI.Motor.Start") of branches that could not be read.</param>
         internal static List<CrossReferenceEntry> Flatten(object crossReferenceResult, string sourcePathFallback,
-            out string? truncation, out List<string> unreadBranches)
+            out string? truncation, out List<string> unreadBranches,
+            Action<CrossReferenceEntry, object, object?>? observe = null)
         {
-            var walk = new Walk(sourcePathFallback);
+            var walk = new Walk(sourcePathFallback, observe);
             truncation = null;
             unreadBranches = walk.Unread;
 
@@ -79,11 +80,16 @@ namespace TiaMcpServer.Siemens
         private sealed class Walk
         {
             private readonly string _fallbackPath;
+            private readonly Action<CrossReferenceEntry, object, object?>? _observe;
             internal readonly List<CrossReferenceEntry> Items = new List<CrossReferenceEntry>();
             internal readonly List<string> Unread = new List<string>();
             internal bool HitEntryLimit;
 
-            internal Walk(string fallbackPath) { _fallbackPath = fallbackPath; }
+            internal Walk(string fallbackPath, Action<CrossReferenceEntry, object, object?>? observe)
+            {
+                _fallbackPath = fallbackPath;
+                _observe = observe;
+            }
 
             /// <summary>Enumerate a SourceObject collection; a failure stops this collection only.</summary>
             internal void Nodes(IEnumerable nodes, List<string> parentHierarchy, int depth, string label)
@@ -162,7 +168,7 @@ namespace TiaMcpServer.Siemens
                 var locations = rf.GetType().GetProperty("Locations")?.GetValue(rf) as IEnumerable;
                 if (locations == null)
                 {
-                    return Add(new CrossReferenceEntry { SourceName = srcName, SourcePath = srcPath, SourceHierarchy = hierarchy, ReferenceName = refName, ReferencePath = refPath });
+                    return Add(new CrossReferenceEntry { SourceName = srcName, SourcePath = srcPath, SourceHierarchy = hierarchy, ReferenceName = refName, ReferencePath = refPath }, rf, null);
                 }
 
                 foreach (var loc in locations)
@@ -179,15 +185,16 @@ namespace TiaMcpServer.Siemens
                         ReferenceLocation = Prop(loc, "ReferenceLocation"),
                         ReferenceType = Prop(loc, "ReferenceType"),
                         Access = Prop(loc, "Access")
-                    })) return false;
+                    }, rf, loc)) return false;
                 }
                 return true;
             }
 
-            private bool Add(CrossReferenceEntry e)
+            private bool Add(CrossReferenceEntry e, object reference, object? location)
             {
                 if (Items.Count >= MaxEntries) { HitEntryLimit = true; return false; }
                 Items.Add(e);
+                _observe?.Invoke(e, reference, location);
                 return true;
             }
         }

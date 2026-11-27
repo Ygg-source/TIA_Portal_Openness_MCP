@@ -1,8 +1,8 @@
 {
   "package": "TIA_MCP_Delivery_v2.7.11",
-  "generatedAt": "2026-11-07T18:06:22.897488+08:00",
-  "source": "live MCP tools/list of TiaMcpServer.exe",
-  "toolCount": 238,
+  "generatedAt": "2026-11-28T00:23:47.773711+08:00",
+  "source": "live V20 Release MCP tools/list of TiaMcpServer.exe",
+  "toolCount": 239,
   "note": "Full roster (--profile full). The default lite profile lists only the core tools; the rest stay reachable via FindTools + CallTool. Runtime tools/list remains authoritative.",
   "tools": [
     {
@@ -170,6 +170,24 @@
         "projectName"
       ],
       "description": "[L1][Project]Attach MCP to an already-open TIA Portal project by name (avoids disposed project handles)."
+    },
+    {
+      "name": "AuditPlcInputUsage",
+      "layer": "L1",
+      "domain": "PLC-Software",
+      "method": "AuditPlcInputUsage",
+      "returnType": "",
+      "parameters": [
+        "softwarePath",
+        "addressRanges",
+        "commentFilterEnabled",
+        "commentKeywords",
+        "fbRuleEnabled",
+        "requiredBlockType",
+        "requiredBlockNumber",
+        "requiredLanguage"
+      ],
+      "description": "[L1][PLC-Software][READ-ONLY] Audit PLC input addresses in the open project, including software units. Reads multilingual tag comments and native references, and scans block XML for absolute operands. Returns per-input uses, rules, counts and completeness. Requires a PLC software path from GetProjectTree and inclusive input ranges."
     },
     {
       "name": "BindUnifiedHmiButtonPressedTag",

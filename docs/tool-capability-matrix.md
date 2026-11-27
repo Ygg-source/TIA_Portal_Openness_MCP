@@ -3,7 +3,7 @@
 本文件由源码中的 `[McpServerTool]` 静态抽取生成，运行时仍以 `tools/list` 为准。
 
 - 生成时间：2026-11-07 19:06:23
-- 工具数量：238
+- 工具数量：239（V20 源码构建）
 
 ## L0
 
@@ -346,6 +346,7 @@
 | CreatePlcBlockGroup | [L2][PLC-Software] Create a (nested) program-block group/folder, creating any missing parent groups along the path. Idempotent — returns ok if the group already exists. groupPath uses '/' separators relative to 'Program blocks' root, e.g. '01_手动控制/手动意图'. Requires: Connect + OpenProject. Use this to set up the 手动/手自动接口/自动 layer folders, then MoveBlockToGroup to organize blocks into them. |
 | MoveBlockToGroup | [L2][PLC-Software] Move/organize an existing block into a program-block group (found anywhere by exact name). Openness cannot reparent a block, so this exports the block, deletes it, and re-imports it into the target group (SIMATIC SD .s7dcl preferred, SimaticML XML fallback for STL/mixed-language). The block number and references are preserved. autoCreateGroup creates the target group path if missing. Requires: Connect + OpenProject + block consistent (compile first). After moving, call CompileAndDiagnosePlc to confirm 0 errors. Note: avoid moving OBs with event bindings via this round-trip. |
 | GetCrossReferences | [L2][PLC-Software]Get cross references for a Step7 block/type (best-effort). Requires applicable object and Openness support. |
+| AuditPlcInputUsage | [L1][PLC-Software] V20 只读审计 PLC I 点的使用位置、注释与块规则。参见 [V20 PLC I 点使用审计](plc-input-usage-audit.md)。 |
 | GetPlcExternalSources | [L2][PLC-Software]List PLC external source names (best-effort) |
 | GetPlcTagTables | [L2][PLC-Software] List all PLC tag table names, including the software units' tables as 'Software units/<unit>/<table>' (pass that path to ExportPlcTagTable; GetPlcTags softwareUnit reads one unit's tags). Requires: Connect + OpenProject. softwarePath from GetProjectTree (e.g. 'PLC_1'). Use before ExportPlcTagTable to get exact table names, or before ImportPlcTagTable to check for conflicts. |
 | ExportPlcTagTable | [L2][PLC-Software]Export one PLC tag table (PlcTagTable) to XML file. A software unit's table: 'Software units/<unit>/<table>' as listed by GetPlcTagTables. |

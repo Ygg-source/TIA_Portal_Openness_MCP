@@ -22,6 +22,7 @@
 3. [`full-project-generation-runbook.md`](full-project-generation-runbook.md) —— 手工多步流程（一把梭优先用 `ScaffoldProject`，本文是分步排障用的降级路径）
 4. [`hmi-plc-tag-binding-and-addressing.md`](hmi-plc-tag-binding-and-addressing.md) / [`hmi-connection-driver-matrix.md`](hmi-connection-driver-matrix.md) / [`HMI_Unified_画面生成规范与模板.md`](HMI_Unified_画面生成规范与模板.md) —— HMI 三件套
 5. [`在线实时读值_使用指南.md`](在线实时读值_使用指南.md) —— 在线只读监控
+6. [V20 PLC I 点使用审计](plc-input-usage-audit.md)
 
 ## 我在排障
 
