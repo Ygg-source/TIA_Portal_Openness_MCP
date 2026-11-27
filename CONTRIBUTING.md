@@ -66,6 +66,39 @@ Issue — that offer is taken seriously and answered.
 
 ---
 
+## Fork 同步
+
+`origin` 是自己的 Fork（`Ygg-source/TIA_Portal_Openness_MCP`），也是唯一推送目标。
+`upstream` 是原始仓库（`bulaofen0036-coder/TIA_Portal_Openness_MCP`），只用于获取更新。
+
+先检查 `git status --short --branch` 和 `git remote -v`，用 `git ls-remote --symref origin HEAD` 和 `git ls-remote --symref upstream HEAD` 确认双方默认分支。保护未提交改动，将自定义 Tool 及对应文档独立提交。先合并 Fork，再合并上游。以下用 `master` 举例，对应 `rev-list` 右列为 `0` 时跳过该合并。
+
+```powershell
+git switch master
+git fetch upstream --prune
+git fetch origin --prune
+git rev-list --left-right --count HEAD...origin/master
+git merge origin/master
+git rev-list --left-right --count HEAD...upstream/master
+git merge upstream/master
+```
+
+冲突时用 `git diff --name-only --diff-filter=U` 列出文件。核对双方修改并保留自定义 Tool。涉及功能行为或架构的冲突，先由维护者确认。
+
+当前以 V20 构建和回归作为推送条件。
+
+```powershell
+dotnet build tools/tiaportal-mcp/src/TiaMcpServer/TiaMcpServer.V20.csproj -c Release
+dotnet run --project tools/tiaportal-mcp/tests/TiaMcpServer.Tests/TiaMcpServer.Tests.csproj -c Release
+py -X utf8 scripts/Check-DeadToolReferences.py
+```
+
+用 V20 新构建核对 lite/full 和 `manifest/tools-list.json`，在独立 V20 测试工程检查 Openness 连接、`GetCrossReferences` 和 [导入与编译链路](templates/mcp-full-e2e-verify/README.md)。回归通过并核对工作区、合并历史与远程后，执行 `git push -u origin master`。
+
+禁止向 `upstream` 推送、强推、rebase 共享分支、`git reset --hard`、未经确认运行 `git clean -fd`、复制上游目录覆盖工作区，或通过删除本地文件解决冲突。
+
+---
+
 ## Pull requests
 
 1. Keep it focused. One problem per PR; a 40-line PR gets merged, a 4000-line one
