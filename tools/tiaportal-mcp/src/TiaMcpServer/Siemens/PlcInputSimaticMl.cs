@@ -186,12 +186,16 @@ namespace TiaMcpServer.Siemens
                     if (scl) use.Access = StructuredTextAccess(body, operandNode);
                     var parameter = operandNode.Parent;
                     if (parameter != null && parameter.Name.LocalName is "Parameter" or "NamelessParameter"
-                        && parameter.Parent is XElement call && Is(call, "CallInfo"))
+                        && parameter.Parent is XElement call && Is(call, "CallInfo")
+                        && parameter.Elements().All(e => e == operandNode
+                            || e.Name.LocalName is "Blank" or "NewLine" or "Comment" or "LineComment" or "BlockComment"
+                            || Token(e) is ":=" or "=>"))
                     {
                         var direction = (string?)parameter.Attribute("Section");
                         if (direction == null && parameter.Elements().Any(e => Token(e) == "=>"))
                             direction = "Output";
                         if (use.Access == "Unknown") use.Access = SectionAccess(direction);
+                        if (Is(node, "Token") && use.Absolute) use.Confirmed = true;
                         use.Pins.Add(CallPin(call, (string?)parameter.Attribute("Name"), direction, (string?)call.Attribute("UId")));
                     }
                 }

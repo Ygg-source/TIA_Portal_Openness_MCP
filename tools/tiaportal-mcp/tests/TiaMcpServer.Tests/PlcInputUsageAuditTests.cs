@@ -179,6 +179,14 @@ namespace TiaMcpServer.Tests
             check(sclUse.Confirmed && sclUse.Span.Canonical == "%I0.1" && sclUse.Access == "Write"
                 && sclUse.Pins.Single().Direction == "Output" && sclUse.Pins.Single().BlockName == "DeviceStatus",
                 "I audit: direct SCL output to an absolute input with a V20 FC call encoded as Instance");
+            var expression = scl.Replace("=&gt;", ":=").Replace("</Parameter>", """
+                <Token Text="OR"/><Access Scope="GlobalVariable">
+                  <Symbol><Component Name="Intermediate"/></Symbol>
+                </Access></Parameter>
+                """);
+            var expressionUses = PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit(expression) + "</Document>"), issues);
+            check(expressionUses.Any(u => u.Absolute && u.Confirmed) && expressionUses.All(u => u.Pins.Count == 0),
+                "I audit: SCL expression operands are uses but do not count as direct pin connections");
             var callee = XDocument.Parse("""
                 <Document><SW.Blocks.FC><AttributeList><Interface><Sections>
                   <Section Name="InOut"><Member Name="value" Datatype="Bool"/></Section>
