@@ -1,0 +1,9 @@
+{
+  "name": "TIA PLC I 点检查",
+  "name_en": "TIA PLC Input Audit",
+  "description": "只读检查已打开的 TIA V20 工程中的 PLC 输入点。",
+  "description_zh": "检查已打开的 TIA V20 工程中的 PLC 输入点，生成中文报告。",
+  "description_en": "Audit PLC input usage in an open TIA Portal V20 project.",
+  "source": "tia-plc-input-audit",
+  "type": "mcp"
+}

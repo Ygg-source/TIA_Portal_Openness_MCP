@@ -1,0 +1,10 @@
+---
+name: audit-plc-input-usage
+display_name: TIA PLC I 点检查
+display_name_en: TIA PLC Input Audit
+description: 用 TIA Portal V20 MCP 检查当前打开的单个工程的 PLC I 点使用情况，并生成中文 HTML。
+description_zh: 检查已打开的 TIA V20 工程中的 PLC 输入点，按配置检查注释排除和指定块只读条件。
+description_en: Check PLC input usage in an open TIA Portal V20 project and produce an HTML report.
+version: "1.0.0"
+author: Ygg-source
+---

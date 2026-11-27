@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "tia-plc-input-audit": {
+      "type": "stdio",
+      "command": "SET_BY_PREPARE_WORKBUDDY",
+      "args": ["--tia-major-version", "20", "--profile", "lite", "--read-only"],
+      "timeout": 180000
+    }
+  }
+}
