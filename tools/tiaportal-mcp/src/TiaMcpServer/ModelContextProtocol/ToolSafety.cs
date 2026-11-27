@@ -58,7 +58,7 @@ namespace TiaMcpServer.ModelContextProtocol
 
         private static readonly HashSet<string> ReadOnlyExtra = new HashSet<string>(StringComparer.Ordinal)
         {
-            "RunOnlineMonitoringSafetySelfTest", "RunHmiActionScriptRecipeSafetySelfTest",
+            "RunOnlineMonitoringSafetySelfTest", "RunHmiActionScriptRecipeSafetySelfTest", "AuditPlcInputUsage",
         };
 
         // Prefix matches that are NOT read-only despite the verb.

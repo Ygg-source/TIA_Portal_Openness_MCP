@@ -96,6 +96,9 @@ namespace TiaMcpServer.Tests
             Console.WriteLine("== 日常编辑工具：参数校验 / 地址 / 组路径 / 归档文件名 / 整台设备守卫 ==");
             EverydayEditSpecTests.Run(Check);
 
+            Console.WriteLine("== PLC input usage audit ==");
+            PlcInputUsageAuditTests.Run(Check);
+
             Console.WriteLine(_fail == 0
                 ? $"{_pass} passed, {_fail} failed, {_skip} skipped."
                 : $"{_pass} passed, {_fail} failed, {_skip} skipped.  <<< 有失败");

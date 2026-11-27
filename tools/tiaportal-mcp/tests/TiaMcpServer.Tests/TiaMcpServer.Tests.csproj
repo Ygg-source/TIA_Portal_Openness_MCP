@@ -82,5 +82,7 @@
     <Compile Include="..\..\src\TiaMcpServer\ModelContextProtocol\TypeMemberReader.cs" Link="TypeMemberReader.cs" />
     <Compile Include="..\..\src\TiaMcpServer\ModelContextProtocol\ClassicHmiMinimalPackageBuilder.cs" Link="ClassicHmiMinimalPackageBuilder.cs" />
     <Compile Include="..\..\src\TiaMcpServer\ModelContextProtocol\ClassicHmiScreenXmlBuilder.cs" Link="ClassicHmiScreenXmlBuilder.cs" />
+    <Compile Include="..\..\src\TiaMcpServer\Siemens\PlcInputUsageAudit.cs" Link="PlcInputUsageAudit.cs" />
+    <Compile Include="..\..\src\TiaMcpServer\Siemens\PlcInputSimaticMl.cs" Link="PlcInputSimaticMl.cs" />
   </ItemGroup>
 </Project>
