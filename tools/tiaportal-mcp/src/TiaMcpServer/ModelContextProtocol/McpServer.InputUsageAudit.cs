@@ -15,7 +15,7 @@ namespace TiaMcpServer.ModelContextProtocol
             [Description("Inclusive ranges, e.g. [\"%I0.0..%I1.7\", \"%IW8..%ID12\"]; a single address is allowed")] string[] addressRanges,
             [Description("Exclude variables with a matching comment in any project language")] bool commentFilterEnabled = true,
             [Description("Case-insensitive comment substrings; default: [\"气缸\"]")] string[]? commentKeywords = null,
-            [Description("Require every executable reference to use the configured block and read-only access")] bool fbRuleEnabled = true,
+            [Description("Require the configured caller and read-only access, allowing verified direct InOut read/write")] bool fbRuleEnabled = true,
             [Description("Required block type (FB, FC or OB)")] string requiredBlockType = "FB",
             [Description("Required block number")] int requiredBlockNumber = 81,
             [Description("Required caller block programming language")] string requiredLanguage = "LAD",
@@ -23,13 +23,16 @@ namespace TiaMcpServer.ModelContextProtocol
             [Description("Required called block type (FB or FC)")] string? requiredCallBlockType = null,
             [Description("Required called block number (positive integer)")] int? requiredCallBlockNumber = null,
             [Description("Required called block name")] string? requiredCallBlockName = null,
-            [Description("Disallow direct input use in GRAPH transitions and permanent pre/post instructions")] bool graphTransitionRuleEnabled = false)
+            [Description("Disallow direct input use in GRAPH transitions and permanent pre/post instructions")] bool graphTransitionRuleEnabled = false,
+            [Description("Exclude standard caller FBs with any of these positive block numbers")] int[]? skipFbNumbers = null,
+            [Description("Exclude standard caller FBs with any of these exact names, ignoring case")] string[]? skipFbNames = null)
         {
             try
             {
                 var audit = new PlcInputUsageAudit(addressRanges, commentFilterEnabled, commentKeywords,
                     fbRuleEnabled, requiredBlockType, requiredBlockNumber, requiredLanguage,
-                    callPinRuleEnabled, requiredCallBlockType, requiredCallBlockNumber, requiredCallBlockName, graphTransitionRuleEnabled);
+                    callPinRuleEnabled, requiredCallBlockType, requiredCallBlockNumber, requiredCallBlockName, graphTransitionRuleEnabled,
+                    skipFbNumbers, skipFbNames);
                 var data = Portal.AuditPlcInputUsage(softwarePath, audit);
                 return new ResponseJsonReport
                 {

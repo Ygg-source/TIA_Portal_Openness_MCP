@@ -101,6 +101,8 @@ namespace TiaMcpServer.Siemens
         internal string? Language { get; set; }
         internal string? Access { get; set; }
         internal bool AccessComplete { get; set; } = true;
+        internal bool HasOtherWrite { get; set; }
+        internal bool BlockScanComplete { get; set; }
         internal string? Location { get; set; }
         internal string? Detail { get; set; }
         internal string? Address { get; set; }
@@ -115,12 +117,16 @@ namespace TiaMcpServer.Siemens
         internal int? TransitionNumber { get; set; }
         internal int? GraphSequence { get; set; }
         internal List<PlcInputCallPin> CallPins { get; } = new List<PlcInputCallPin>();
+        internal bool IsDirectInOutWrite => ConfirmedUsage && AccessComplete && !HasOtherWrite
+            && (Access is "RW" or "ReadWriteAndSymbol") && CallPins.Any(p => p.Direction == "InOut")
+            && CallPins.All(p => p.Direction is "Input" or "InOut");
 
-        internal JsonObject ToJson() => new JsonObject
+        internal JsonObject ToJson(bool inOutWriteAllowed = false) => new JsonObject
         {
             ["blockPath"] = BlockPath, ["blockType"] = BlockType, ["blockNumber"] = BlockNumber,
             ["language"] = Language, ["access"] = Access, ["location"] = Location, ["detail"] = Detail,
             ["accessComplete"] = AccessComplete && (PlcInputUsageAudit.IsRead(Access) || PlcInputUsageAudit.IsWrite(Access)),
+            ["inOutWriteAllowed"] = inOutWriteAllowed,
             ["address"] = Address, ["origin"] = Origin, ["absolute"] = Absolute, ["confirmedUsage"] = ConfirmedUsage,
             ["network"] = Network, ["blockName"] = BlockName, ["symbol"] = Symbol, ["graphRegion"] = GraphRegion,
             ["transitionName"] = TransitionName, ["transitionNumber"] = TransitionNumber, ["graphSequence"] = GraphSequence,
@@ -141,6 +147,7 @@ namespace TiaMcpServer.Siemens
         internal bool SymbolScanComplete { get; set; } = true;
         internal bool GraphSymbolScanComplete { get; set; } = true;
         internal List<PlcInputAuditReference> References { get; } = new List<PlcInputAuditReference>();
+        internal List<string> ReferenceIssues { get; } = new List<string>();
     }
 
     internal sealed class PlcInputUsageAudit
@@ -148,7 +155,8 @@ namespace TiaMcpServer.Siemens
         internal PlcInputUsageAudit(string[] addressRanges, bool commentEnabled, string[]? keywords,
             bool blockEnabled, string blockType, int blockNumber, string language,
             bool callPinEnabled = false, string? callBlockType = null, int? callBlockNumber = null,
-            string? callBlockName = null, bool graphEnabled = false)
+            string? callBlockName = null, bool graphEnabled = false,
+            int[]? skipFbNumbers = null, string[]? skipFbNames = null)
         {
             if (addressRanges == null || addressRanges.Length == 0)
                 throw new ArgumentException("addressRanges requires at least one input address or inclusive range.");
@@ -172,6 +180,10 @@ namespace TiaMcpServer.Siemens
             CallBlockNumber = callBlockNumber;
             CallBlockName = (callBlockName ?? "").Trim();
             GraphEnabled = graphEnabled;
+            if (skipFbNumbers?.Any(n => n < 1) == true || skipFbNames?.Any(n => string.IsNullOrWhiteSpace(n)) == true)
+                throw new ArgumentException("Skip FB selectors must be positive block numbers or nonempty names.");
+            SkipFbNumbers = new HashSet<int>(skipFbNumbers ?? Array.Empty<int>());
+            SkipFbNames = new HashSet<string>((skipFbNames ?? Array.Empty<string>()).Select(n => n.Trim()), StringComparer.OrdinalIgnoreCase);
             if (CallPinEnabled && (CallBlockType is not ("FB" or "FC") || CallBlockNumber is not > 0 || CallBlockName.Length == 0))
                 throw new ArgumentException("The enabled call pin rule requires FB or FC, a positive block number and a nonempty block name.");
         }
@@ -189,6 +201,10 @@ namespace TiaMcpServer.Siemens
         private string CallBlockType { get; }
         private int? CallBlockNumber { get; }
         private string CallBlockName { get; }
+        private HashSet<int> SkipFbNumbers { get; }
+        private HashSet<string> SkipFbNames { get; }
+        internal bool SkipBlock(string type, int number, string name)
+            => type == "FB" && (SkipFbNumbers.Contains(number) || SkipFbNames.Contains(name));
 
         internal bool InRange(PlcInputSpan span) => Ranges.Any(span.Overlaps);
         internal bool MayContainStart(long start) => Ranges.Any(range => start <= range.End);
@@ -219,17 +235,33 @@ namespace TiaMcpServer.Siemens
         {
             var distinct = references.GroupBy(r => (r.BlockPath, r.BlockType, r.BlockNumber, r.Language, r.Access, r.AccessComplete,
                 r.Location, r.Detail, r.Address, r.Origin, r.Absolute, r.ConfirmedUsage, r.Symbol,
-                r.GraphRegion, r.TransitionNumber, r.GraphSequence)).Select(g => g.First()).ToList();
+                r.GraphRegion, r.TransitionNumber, r.GraphSequence, r.HasOtherWrite, r.IsDirectInOutWrite)).Select(g => g.First()).ToList();
             // Native records identify a network. XML identifies the individual wire or token inside it.
             var xml = distinct.Where(r => r.Origin == "simaticML" && r.Absolute && r.Network.HasValue)
                 .ToLookup(MatchingAbsoluteAccess);
             return distinct.Where(r => r.Origin != "crossReference" || !r.Absolute || !r.Network.HasValue
-                || !xml.Contains(MatchingAbsoluteAccess(r))).ToList();
+                || !xml.Contains(MatchingAbsoluteAccess(r))
+                || xml[MatchingAbsoluteAccess(r)].Any(match => match.IsDirectInOutWrite)).ToList();
         }
 
         private static (string?, int?, string?, string?) MatchingAbsoluteAccess(PlcInputAuditReference r)
             => (r.BlockPath, r.Network, r.Address, IsRead(r.Access) ? "Read" : r.Access == "WriteAndSymbol" ? "Write"
                 : r.Access == "ReadWriteAndSymbol" ? "RW" : r.Access);
+
+        private static bool InOutWriteAllowed(PlcInputAuditReference reference,
+            ILookup<(string?, int?, bool), PlcInputAuditReference> xmlByNetwork, string? pointName)
+        {
+            if (reference.IsDirectInOutWrite) return true;
+            // Native references can summarize a network rather than identify the individual wire.
+            if (reference.Origin != "crossReference" || !IsWrite(reference.Access) || !reference.Network.HasValue
+                || reference.BlockPath == null || reference.Language == "GRAPH") return false;
+            var operands = xmlByNetwork[(reference.BlockPath, reference.Network, reference.Absolute)].ToList();
+            return operands.Any(r => r.IsDirectInOutWrite) && operands.All(r => r.BlockScanComplete && r.ConfirmedUsage
+                && r.AccessComplete && (IsRead(r.Access) || r.IsDirectInOutWrite)
+                && (reference.Absolute ? reference.Address == r.Address
+                    : string.Equals(string.IsNullOrEmpty(reference.Symbol) ? pointName : reference.Symbol?.Trim('"'),
+                        r.Symbol, StringComparison.OrdinalIgnoreCase)));
+        }
 
         internal JsonObject Summarize(IEnumerable<PlcInputAuditPoint> points, IEnumerable<string> warnings,
             bool inventoryComplete, bool absoluteScanComplete, bool callPinScanComplete = true, bool graphScanComplete = true)
@@ -248,6 +280,9 @@ namespace TiaMcpServer.Siemens
                 if (point.Table == null) absoluteOnly++;
                 else tags++;
                 var references = DistinctReferences(point.References);
+                var xmlByNetwork = references.Where(r => r.Origin == "simaticML")
+                    .ToLookup(r => (r.BlockPath, r.Network, r.Absolute));
+                var allowedInOut = new HashSet<PlcInputAuditReference>();
                 var hasUse = references.Any(r => r.ConfirmedUsage);
                 var reasons = new List<string>();
                 var violations = new JsonArray();
@@ -268,7 +303,6 @@ namespace TiaMcpServer.Siemens
 
                 void Violation(string rule, string code, string message, PlcInputAuditReference? reference = null)
                 {
-                    reasons.Add(message);
                     violations.Add(new JsonObject
                     {
                         ["rule"] = rule, ["code"] = code, ["message"] = message,
@@ -280,15 +314,22 @@ namespace TiaMcpServer.Siemens
                 {
                     if (CommentEnabled && commentError) reasons.Add("Multilingual comments could not be read completely.");
                     if (!inventoryComplete) reasons.Add("The standard-program inventory is incomplete.");
-                    if (!point.ReferencesComplete) reasons.Add("Native references could not be read completely.");
+                    if (!point.ReferencesComplete)
+                    {
+                        reasons.Add("Native references could not be read completely.");
+                        reasons.AddRange(point.ReferenceIssues);
+                    }
                     if (!point.SymbolScanComplete) reasons.Add("An XML symbol could not be resolved to a unique input identity.");
                     if (!absoluteScanComplete) reasons.Add("The absolute-address scan is incomplete.");
                     if (CallPinEnabled && !callPinScanComplete) reasons.Add("The call-pin scan is incomplete.");
                     if (GraphEnabled && !graphScanComplete) reasons.Add("The GRAPH scan is incomplete.");
+                    if (GraphEnabled && !point.GraphSymbolScanComplete) reasons.Add("A GRAPH symbol could not be resolved to a unique input identity.");
                 }
                 foreach (var reference in references)
                 {
                     var site = (reference.BlockPath ?? "(unresolved user)") + " " + reference.Location;
+                    var inOutAllowed = InOutWriteAllowed(reference, xmlByNetwork, point.Name);
+                    if (inOutAllowed) allowedInOut.Add(reference);
                     if (!excluded && !reference.ConfirmedUsage)
                         reasons.Add($"{site}: the usage could not be confirmed.");
                     if (BlockEnabled && !excluded && reference.ConfirmedUsage)
@@ -305,7 +346,7 @@ namespace TiaMcpServer.Siemens
                             callerComplete = false;
                             reasons.Add($"{site}: the caller block properties could not be confirmed.");
                         }
-                        if (IsWrite(reference.Access))
+                        if (IsWrite(reference.Access) && !inOutAllowed)
                         {
                             callerFail = true;
                             Violation("caller", "NOT_READ_ONLY", $"{site}: {reference.Access} is not read-only.", reference);
@@ -378,7 +419,7 @@ namespace TiaMcpServer.Siemens
                 {
                     ["name"] = point.Name, ["address"] = point.Address, ["coveredAddress"] = point.Span.Canonical,
                     ["table"] = point.Table, ["softwareUnit"] = point.SoftwareUnit, ["comment"] = point.Comment.DeepClone(),
-                    ["references"] = new JsonArray(references.Select(r => (JsonNode)r.ToJson()).ToArray()),
+                    ["references"] = new JsonArray(references.Select(r => (JsonNode)r.ToJson(allowedInOut.Contains(r))).ToArray()),
                     ["callPinConnections"] = pinConnections, ["graphLocations"] = graphLocations,
                     ["status"] = status == "SAFETY_ONLY" ? "UNUSED" : status,
                     ["safetyOnlyExcluded"] = status == "SAFETY_ONLY",
@@ -386,7 +427,8 @@ namespace TiaMcpServer.Siemens
                     ["callPinRuleStatus"] = pinStatus, ["graphDirectUseStatus"] = graphStatus,
                     ["complete"] = complete, ["hasSafetyUse"] = point.HasSafetyUse,
                     ["commentStatus"] = !CommentEnabled ? "NOT_EVALUATED" : excluded ? "EXCLUDED" : commentError ? "INCOMPLETE" : "PASS",
-                    ["reasons"] = Strings(reasons.Distinct()), ["violations"] = violations,
+                    ["reasons"] = Strings(violations.Select(v => v!["message"]!.GetValue<string>()).Concat(reasons).Distinct()),
+                    ["uncertaintyReasons"] = Strings(reasons.Distinct()), ["violations"] = violations,
                 });
 
                 string RuleStatus(bool enabled, bool fail, bool ruleComplete) => !enabled || excluded ? "NOT_EVALUATED"
@@ -407,6 +449,8 @@ namespace TiaMcpServer.Siemens
                     ["callPinRuleEnabled"] = CallPinEnabled, ["requiredCallBlockType"] = CallBlockType,
                     ["requiredCallBlockNumber"] = CallBlockNumber, ["requiredCallBlockName"] = CallBlockName,
                     ["graphTransitionRuleEnabled"] = GraphEnabled,
+                    ["skipFbNumbers"] = new JsonArray(SkipFbNumbers.OrderBy(n => n).Select(n => (JsonNode)JsonValue.Create(n)!).ToArray()),
+                    ["skipFbNames"] = Strings(SkipFbNames.OrderBy(n => n, StringComparer.OrdinalIgnoreCase)),
                 },
                 ["rangeTagCount"] = tags, ["absoluteOnlyCount"] = absoluteOnly, ["excludedCount"] = counts["EXCLUDED"],
                 ["usedCount"] = used, ["unusedCount"] = counts["UNUSED"], ["safetyOnlyExcludedCount"] = counts["SAFETY_ONLY"],

@@ -13,6 +13,7 @@ namespace TiaMcpServer.Siemens
         internal string[]? Symbol { get; set; }
         internal string Access { get; set; } = "Unknown";
         internal bool AccessComplete { get; set; } = true;
+        internal bool HasOtherWrite { get; set; }
         internal int Network { get; set; }
         internal string Site { get; set; } = "";
         internal bool Confirmed { get; set; }
@@ -247,6 +248,7 @@ namespace TiaMcpServer.Siemens
                     {
                         issues.Add($"{use.Site}: could not resolve a unique part UId {callUid}");
                         directions.Add("Unknown");
+                        use.HasOtherWrite = true;
                         continue;
                     }
                     var part = matchingParts[0];
@@ -259,7 +261,12 @@ namespace TiaMcpServer.Siemens
                         if (connectedPins.Add((callUid, pin)))
                             use.Pins.Add(CallPin(call, pin, section, callUid));
                     }
-                    else directions.Add(InstructionAccess((string?)part.Attribute("Name"), pin));
+                    else
+                    {
+                        var access = InstructionAccess((string?)part.Attribute("Name"), pin);
+                        directions.Add(access);
+                        use.HasOtherWrite |= access == "Unknown" || PlcInputUsageAudit.IsWrite(access);
+                    }
                 }
             }
             use.AccessComplete = !directions.Remove("Unknown");

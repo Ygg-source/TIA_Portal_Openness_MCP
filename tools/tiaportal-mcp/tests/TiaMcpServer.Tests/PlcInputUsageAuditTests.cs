@@ -119,6 +119,9 @@ namespace TiaMcpServer.Tests
                 "I audit: preserve every call and pin in the network for scoped symbols and absolute operands");
             check(symbolic.Pins[0].BlockName == "Target" && symbolic.Pins[0].InstanceName == "TargetInstance"
                 && symbolic.Pins[0].InstanceScope == "GlobalVariable", "I audit: distinguish FB type and instance");
+            var sameOperandWrite = PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit(flg.Replace("Contact", "Coil")) + "</Document>"), issues);
+            check(!symbolic.HasOtherWrite && sameOperandWrite.Single(u => u.Symbol != null).HasOtherWrite,
+                "I audit: identify ordinary write wires beside a direct InOut connection");
             foreach (var (section, kind) in new[] { ("Static", "MultiInstance"), ("InOut", "ParameterInstance") })
             {
                 var local = flg.Replace("Instance Scope=\"GlobalVariable\"", "Instance Scope=\"LocalVariable\"");
@@ -138,12 +141,31 @@ namespace TiaMcpServer.Tests
                 var point = Point("Tag", "%I0.0", use, Ref("FB", 81, "LAD", "Read"));
                 var row = Row(Report(AuditRules(pin.BlockType, pin.BlockNumber, pin.BlockName, caller: true), point), "Tag");
                 check(row["callPinRuleStatus"]!.ToString() == "PASS"
-                    && row["callerRuleStatus"]!.ToString() == (pin.Direction == "InOut" ? "FAIL" : "PASS"),
+                    && row["callerRuleStatus"]!.ToString() == "PASS",
                     $"I audit: {pin.BlockType} {pin.Direction} is accepted by pin rule independently of caller access");
                 var independent = Row(Report(AuditRules(pin.BlockType, pin.BlockNumber, pin.BlockName), point), "Tag");
                 check(Status(independent) == "PASS" && independent["callerRuleStatus"]!.ToString() == "NOT_EVALUATED",
                     "I audit: disabling caller rule preserves the pin decision");
             }
+            var directInOut = Ref("FB", 81, "LAD", "RW");
+            directInOut.Origin = "simaticML";
+            directInOut.Symbol = "Tag";
+            directInOut.Network = 1;
+            directInOut.BlockScanComplete = true;
+            directInOut.CallPins.Add(symbolic.Pins.Single(p => p.Direction == "InOut"));
+            var nativeInOut = Ref("FB", 81, "LAD", "ReadWriteAndSymbol");
+            nativeInOut.Network = 1;
+            var inOutPoint = Point("Tag", "%I0.0", nativeInOut, directInOut);
+            var callerOnly = AuditRules(null, null, null, pins: false, caller: true);
+            check(Status(Row(Report(callerOnly, inOutPoint), "Tag")) == "PASS",
+                "I audit: reconcile a native read/write reference with the verified InOut operation in the same network");
+            directInOut.HasOtherWrite = true;
+            check(Status(Row(Report(callerOnly, inOutPoint), "Tag")) == "FAIL",
+                "I audit: an ordinary write on the same operand remains a violation");
+            directInOut.HasOtherWrite = false;
+            nativeInOut.Network = 2;
+            check(Status(Row(Report(callerOnly, inOutPoint), "Tag")) == "FAIL",
+                "I audit: InOut in one network does not waive a write in another network");
             foreach (var pin in absolute.Pins.Where(p => p.Direction is not ("Input" or "InOut")))
             {
                 var use = Ref("FB", 81, "LAD", "Read");
@@ -258,8 +280,11 @@ namespace TiaMcpServer.Tests
             only.HasSafetyUse = true;
             var incomplete = Point("Unresolved", "%I0.2");
             incomplete.ReferencesComplete = false;
+            incomplete.ReferenceIssues.Add("NW4 identity is unavailable.");
             var audit = AuditRules("FB", 82, "Target", caller: true, graph: true);
             var report = Report(audit, used, only, incomplete);
+            check(Row(report, "Unresolved")["uncertaintyReasons"]!.AsArray().Any(r => r!.ToString() == "NW4 identity is unavailable."),
+                "I audit: preserve the concrete uncertainty for the point");
             check(report["checkedInputCount"]!.GetValue<int>() == 2 && report["failCount"]!.GetValue<int>() == 1
                 && report["unconfirmedCount"]!.GetValue<int>() == 1 && report["safetyOnlyExcludedCount"]!.GetValue<int>() == 1
                 && report["ruleViolationCounts"]!["caller"]!.GetValue<int>() == 1 && report["ruleViolationCounts"]!["graphDirectUse"]!.GetValue<int>() == 1
@@ -275,6 +300,11 @@ namespace TiaMcpServer.Tests
             report = Report(AuditRules(null, null, null, pins: false), Point("Used", "%I0.0", Ref("FB", 81, "LAD", "Read")));
             check(report["notEvaluatedCount"]!.GetValue<int>() == 1 && report["passCount"]!.GetValue<int>() == 0,
                 "I audit: all usage rules disabled");
+            var skipAudit = new PlcInputUsageAudit(new[] { "%I0.0" }, false, null, false, "FB", 81, "LAD",
+                skipFbNumbers: new[] { 8, 81 }, skipFbNames: new[] { "Named FB", "AnotherFB" });
+            check(skipAudit.SkipBlock("FB", 81, "Different") && skipAudit.SkipBlock("FB", 900, "named fb")
+                && skipAudit.SkipBlock("FB", 901, "AnotherFB") && !skipAudit.SkipBlock("FC", 81, "Named FB")
+                && !skipAudit.SkipBlock("FB", 901, "Other"), "I audit: skip assigned FB numbers or exact names only");
         }
 
         private static PlcInputUsageAudit AuditRules(string? type, int? number, string? name, bool pins = true,

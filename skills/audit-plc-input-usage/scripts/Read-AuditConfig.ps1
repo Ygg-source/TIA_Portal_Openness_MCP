@@ -55,6 +55,23 @@ $ranges = for ($index = 0; $index -lt $config.scope.inputRanges.Count; $index++)
 }
 $comment = $config.checks.commentExclusion
 $block = $config.checks.fbReadOnly
+$skipNumbers = @()
+$skipNames = @()
+if ($config.scope.Contains('skipFbBlocks')) {
+    if ($config.scope.skipFbBlocks -isnot [array]) {
+        InvalidField '$.scope.skipFbBlocks' '填写由正整数 FB 编号或非空 FB 名称组成的数组。'
+    }
+    for ($index = 0; $index -lt $config.scope.skipFbBlocks.Count; $index++) {
+        $selector = $config.scope.skipFbBlocks[$index]
+        if ($selector -is [long] -and $selector -gt 0 -and $selector -le [int]::MaxValue) {
+            $skipNumbers += [int]$selector
+        } elseif ($selector -is [string] -and -not [string]::IsNullOrWhiteSpace($selector)) {
+            $skipNames += $selector.Trim()
+        } else {
+            InvalidField ('$.scope.skipFbBlocks[{0}]' -f $index) '填写大于零的 32 位 FB 编号或非空 FB 名称。'
+        }
+    }
+}
 if ($comment.enabled -isnot [bool]) { InvalidField '$.checks.commentExclusion.enabled' '填写 true 或 false。' }
 if ($comment.keywords -isnot [array] -or @($comment.keywords.Where({ $_ -isnot [string] })).Count -ne 0) {
     InvalidField '$.checks.commentExclusion.keywords' '填写字符串数组。'
@@ -91,6 +108,8 @@ if ($prefix -isnot [string] -or [string]::IsNullOrWhiteSpace($prefix) -or
         requiredBlockType = $block.targetBlockType
         requiredBlockNumber = $block.targetBlockNumber
         requiredLanguage = $block.targetLanguage
+        skipFbNumbers = $skipNumbers
+        skipFbNames = $skipNames
     }
     report = @{
         outputDirectory = $outputDirectory.Trim()

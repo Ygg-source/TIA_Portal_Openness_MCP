@@ -4,7 +4,8 @@
   "scope": {
     "inputRanges": [
       { "start": "%I4000.0", "end": "%I4500.0" }
-    ]
+    ],
+    "skipFbBlocks": []
   },
   "checks": {
     "commentExclusion": { "enabled": true, "keywords": ["气缸", "备用", "预留"] },

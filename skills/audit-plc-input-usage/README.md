@@ -36,6 +36,7 @@ pwsh.exe -NoProfile -File (Join-Path $skill 'scripts\Read-AuditConfig.ps1') -Ini
 | inputRanges | $.scope.inputRanges | 要检查的 I 地址范围列表。每段写一对花括号，多个范围用逗号隔开，最后一段后面不加逗号。空数组会停止检查。 |
 | start | $.scope.inputRanges[n].start | 第 n 段的起始地址，例如 "%I0.0"。 |
 | end | $.scope.inputRanges[n].end | 第 n 段的结束地址，例如 "%I15.7"。两端均计入。只查单个地址时两端填写相同地址。 |
+| 跳过 FB | $.scope.skipFbBlocks | 可省略。填写多个 FB 编号或名称，例如 `[81, 120, "Feedback_Check"]`。数字匹配编号，字符串匹配完整名称、忽略大小写，命中任一项即跳过该 FB 内的用法和正文扫描。 |
 | 注释启用 | $.checks.commentExclusion.enabled | true 时按关键词排除 I 点。改为 false 后停止排除，原本会被排除的点也参加使用检查，报告仍显示注释。 |
 | 注释关键词 | $.checks.commentExclusion.keywords | 填字符串数组，例如 ["气缸", "备用"]。任一项目语言的注释包含任一关键词即排除，匹配时忽略大小写。[] 表示没有关键词。 |
 | FB 检查启用 | $.checks.fbReadOnly.enabled | true 时检查每处用法的块类型、编号、语言和只读要求。改为 false 后继续统计 I 点使用情况和注释排除，指定块规则显示未启用，合格和不合格数均为零。 |

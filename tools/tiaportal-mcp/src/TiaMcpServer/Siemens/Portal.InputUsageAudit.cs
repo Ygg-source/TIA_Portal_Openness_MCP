@@ -33,6 +33,13 @@ namespace TiaMcpServer.Siemens
             internal string? InstanceOf;
             internal ILookup<string, string>? PinDirections;
             internal PlcInputProgramKind Kind;
+            internal bool Skipped;
+
+            internal JsonObject IdentityJson() => new JsonObject
+            {
+                ["blockType"] = Type, ["blockNumber"] = Number, ["blockName"] = Name, ["blockPath"] = Path,
+                ["language"] = Language,
+            };
         }
 
         internal JsonObject AuditPlcInputUsage(string softwarePath, PlcInputUsageAudit audit)
@@ -142,6 +149,12 @@ namespace TiaMcpServer.Siemens
             }
             if (!ReadInputAuditSafetyRuntime(cpu, blocks.Values, warnings))
                 inventoryComplete = false;
+            var skippedBlocks = new JsonArray();
+            foreach (var block in blocks.Values.Where(b => b.Kind == PlcInputProgramKind.Standard && audit.SkipBlock(b.Type, b.Number, b.Name)))
+            {
+                block.Skipped = true;
+                skippedBlocks.Add(block.IdentityJson());
+            }
             var byPath = blockPaths.ToLookup(b => b.Path, b => b.Block, StringComparer.OrdinalIgnoreCase);
             var tagIdentities = new Dictionary<string, List<PlcInputAuditPoint?>>(StringComparer.OrdinalIgnoreCase);
 
@@ -186,6 +199,7 @@ namespace TiaMcpServer.Siemens
                         {
                             nativeFailures++;
                             point.ReferencesComplete = false;
+                            point.ReferenceIssues.Add(ex.Message);
                             warnings.Add($"{tablePath}/{point.Name}: {ex.Message}");
                             if (possibleStructuredTag && !audit.InRange(span)) inventoryComplete = false;
                         }
@@ -215,6 +229,8 @@ namespace TiaMcpServer.Siemens
 
             int xmlScanned = 0, xmlFailures = 0, xmlUnsupported = 0, absoluteOccurrences = 0, graphScanned = 0, graphFailures = 0;
             int xmlExportAttempts = 0, safetyXmlExportAttempts = 0;
+            var unreadableBlocks = new JsonArray();
+            var incompleteBlocks = new JsonArray();
             var codeTargets = blocks.Values.Where(b => b.Kind == PlcInputProgramKind.Standard && b.Type is "FB" or "FC")
                 .ToLookup(b => b.Name, StringComparer.OrdinalIgnoreCase);
             var qualifiedTargets = codeTargets.SelectMany(g => g).Where(b => b.Namespace.Length != 0)
@@ -231,7 +247,7 @@ namespace TiaMcpServer.Siemens
             var file = new FileInfo(Path.Combine(temp, "block.xml"));
             try
             {
-                foreach (var (block, metadata) in blocks.Where(p => PlcInputUsageAudit.CanExport(p.Value.Kind, p.Key is CodeBlock))
+                foreach (var (block, metadata) in blocks.Where(p => !p.Value.Skipped && PlcInputUsageAudit.CanExport(p.Value.Kind, p.Key is CodeBlock))
                     .Select(p => (p.Key, p.Value)))
                 {
                     var path = metadata.Path;
@@ -258,6 +274,9 @@ namespace TiaMcpServer.Siemens
                         if (issues.Count > 0)
                         {
                             xmlUnsupported++;
+                            var incomplete = metadata.IdentityJson();
+                            incomplete["issues"] = PlcInputUsageAudit.Strings(issues.Distinct());
+                            incompleteBlocks.Add(incomplete);
                             warnings.Add($"{path}: {string.Join("; ", issues.Distinct())}.");
                         }
                         var siteCounts = matches.Where(m => m.Symbol != null)
@@ -314,6 +333,7 @@ namespace TiaMcpServer.Siemens
                                 BlockPath = path, BlockType = metadata.Type, BlockNumber = metadata.Number, BlockName = metadata.Name,
                                 Language = metadata.Language, Access = access, Location = match.Site, Network = match.Network,
                                 AccessComplete = match.AccessComplete || match.Access == "Unknown" && access != "Unknown",
+                                HasOtherWrite = match.HasOtherWrite, BlockScanComplete = issues.Count == 0,
                                 Address = match.Absolute ? match.Span.Canonical : null,
                                 Symbol = match.Symbol == null ? null : string.Join(".", match.Symbol),
                                 Origin = "simaticML", Absolute = match.Absolute, ConfirmedUsage = match.Confirmed,
@@ -331,6 +351,9 @@ namespace TiaMcpServer.Siemens
                     catch (Exception ex) when (!PortalFailureClassifier.IsPortalProcessLost(ex))
                     {
                         xmlFailures++;
+                        var unreadable = metadata.IdentityJson();
+                        unreadable["reason"] = ex.Message;
+                        unreadableBlocks.Add(unreadable);
                         if (graph) graphFailures++;
                         warnings.Add($"{path}: block XML could not be scanned: {ex.Message}");
                     }
@@ -375,6 +398,8 @@ namespace TiaMcpServer.Siemens
                 ["xmlExportAttempts"] = xmlExportAttempts, ["safetyXmlExportAttempts"] = safetyXmlExportAttempts,
                 ["graphScannedBlocks"] = graphScanned, ["graphFailedBlocks"] = graphFailures,
                 ["unclassifiedBlocks"] = blocks.Values.Count(b => b.Kind == PlcInputProgramKind.Unknown),
+                ["unreadableBlocks"] = unreadableBlocks, ["incompleteBlocks"] = incompleteBlocks,
+                ["skippedFbBlocks"] = skippedBlocks,
             };
             return report;
         }
@@ -548,6 +573,7 @@ namespace TiaMcpServer.Siemens
                     if (userBlock == null || !blocks.TryGetValue(userBlock, out var block) || block.Kind == PlcInputProgramKind.Unknown)
                     {
                         point.ReferencesComplete = false;
+                        point.ReferenceIssues.Add($"Could not confirm the block identity at {sourcePath} {entry.ReferenceLocation}.");
                         return;
                     }
                     if (block.Kind == PlcInputProgramKind.Safety)
@@ -555,6 +581,7 @@ namespace TiaMcpServer.Siemens
                         point.HasSafetyUse |= usage.ConfirmedUsage;
                         return;
                     }
+                    if (block.Skipped) return;
                     usage.BlockPath = block.Path;
                     usage.BlockName = block.Name;
                     usage.BlockType = block.Type;

@@ -56,7 +56,7 @@ $blockLabel = if ($blockEnabled) {
         'STL' { '语句表' }
         default { $data.configuration.requiredLanguage }
     }
-    '指定块只读检查已启用（{0}{1}，{2}）。' -f $data.configuration.requiredBlockType, $data.configuration.requiredBlockNumber, $language
+    '指定块访问检查已启用（{0}{1}，{2}），确认的 InOut 直连允许读写。' -f $data.configuration.requiredBlockType, $data.configuration.requiredBlockNumber, $language
 } else { '指定块只读检查未启用。' }
 $commentLabel = if ($data.configuration.commentFilterEnabled) { '注释排除已启用。' } else { '注释排除未启用。' }
 $rangeLabel = Html ($data.addressRanges -join '、')
@@ -92,8 +92,12 @@ foreach ($point in $data.points) {
             ': (Write|WriteAndSymbol|RW|ReadWriteAndSymbol) is not read-only\.$' { '发现写入用法。' }
         }) | Select-Object -Unique
         if ($issues) { $issues -join ' ' } else { '存在不符合指定块只读要求的用法。' }
-    } elseif ($color -eq 'yellow') { '本次无法确认该点的检查结论。' } else { '—' }
-    if ($color -eq 'red' -and -not $point.complete) { $detail += ' 部分用法仍无法确认。' }
+    } else { '—' }
+    if (-not $point.complete) {
+        $uncertainty = if ($point.Contains('uncertaintyReasons')) { $point.uncertaintyReasons } else { $point.reasons }
+        $reasonText = if ($uncertainty) { $uncertainty -join [Environment]::NewLine } else { '检查覆盖不完整。' }
+        $detail = if ($detail -eq '—') { $reasonText } else { $detail + [Environment]::NewLine + $reasonText }
+    }
     $comment = @(
         foreach ($entry in $point.comment.GetEnumerator()) {
             if ($entry.Key -cne '_error' -and $entry.Value -is [string] -and $entry.Value.Trim()) { $entry.Value }
@@ -105,6 +109,23 @@ foreach ($point in $data.points) {
         $name, (Html $point.address), $commentText, $color, $label, (Html $detail)))
 }
 if ($rows.Length -eq 0) { [void]$rows.AppendLine('<tr><td colspan="5">无符合明细展示条件的 I 点。</td></tr>') }
+
+$coverageLabels = [ordered]@{
+    unreadableBlocks = '无法读取的块'
+    incompleteBlocks = '解析不完整的块及网络格式'
+    skippedFbBlocks = '按配置跳过的 FB'
+}
+$coverageHtml = foreach ($key in $coverageLabels.Keys) {
+    $blocks = if ($data.coverage) { $data.coverage[$key] }
+    if (-not $blocks) { continue }
+    $blockRows = foreach ($item in ($blocks | Sort-Object blockType, blockNumber, blockName)) {
+        $blockId = '{0}{1}' -f $item.blockType, $item.blockNumber
+        $reason = if ($item.issues) { $item.issues -join [Environment]::NewLine } else { $item.reason }
+        '<tr><td>{0}</td><td>{1}</td><td>{2}</td></tr>' -f (Html $blockId), (Html $item.blockName), (Html $reason)
+    }
+    '<h2>{0}（{1}）</h2><div class="table"><table><thead><tr><th>块编号</th><th>块名称</th><th>原因</th></tr></thead><tbody>{2}</tbody></table></div>' -f
+        $coverageLabels[$key], $blocks.Count, ($blockRows -join [Environment]::NewLine)
+}
 
 $html = @"
 <!doctype html>
@@ -138,9 +159,10 @@ span{display:inline-block;padding:.04rem .32rem;border-radius:.2rem}
 <p>颜色说明　<span class="green">符合要求</span> <span class="red">不符合要求</span>
 <span class="yellow">无法确认</span> <span class="gray">未启用或已排除</span></p>
 <div class="table"><table aria-label="I 点检查明细">
-<thead><tr><th>名称</th><th>地址</th><th>注释</th><th>结果</th><th>不符合内容</th></tr></thead>
+<thead><tr><th>名称</th><th>地址</th><th>注释</th><th>结果</th><th>原因</th></tr></thead>
 <tbody>
 $rows</tbody></table></div>
+$($coverageHtml -join [Environment]::NewLine)
 </main></body></html>
 "@
 $file = [IO.File]::Open($path, 'CreateNew', 'Write')
