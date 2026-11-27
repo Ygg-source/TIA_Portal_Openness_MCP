@@ -19,3 +19,5 @@ bin-build/
 
 # python 缓存
 __pycache__/
+/skills/audit-plc-input-usage/config/audit-config.json
+/workbuddy/skills/audit-plc-input-usage/config/audit-config.json

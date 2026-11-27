@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "plc": { "softwarePath": "" },
+  "scope": {
+    "inputRanges": [
+      { "start": "%I0.0", "end": "%I15.7" },
+      { "start": "%I32.0", "end": "%I47.7" }
+    ]
+  },
+  "checks": {
+    "commentExclusion": { "enabled": true, "keywords": ["气缸"] },
+    "fbReadOnly": {
+      "enabled": true,
+      "targetBlockType": "FB",
+      "targetBlockNumber": 81,
+      "targetLanguage": "LAD"
+    }
+  },
+  "report": {
+    "outputDirectory": "",
+    "fileNamePrefix": "PLC_I点使用情况检查"
+  }
+}
