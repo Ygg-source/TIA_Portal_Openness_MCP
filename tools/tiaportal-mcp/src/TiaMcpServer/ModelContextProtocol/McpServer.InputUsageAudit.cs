@@ -9,7 +9,7 @@ namespace TiaMcpServer.ModelContextProtocol
 {
     public partial class McpServer
     {
-        [McpServerTool(Name = "AuditPlcInputUsage"), Description("[L1][PLC-Software][READ-ONLY] Audit PLC input addresses in the open project, including software units. Reads multilingual tag comments and native references, and scans block XML for absolute operands. Returns per-input uses, rules, counts and completeness. Requires a PLC software path from GetProjectTree and inclusive input ranges.")]
+        [McpServerTool(Name = "AuditPlcInputUsage"), Description("[L1][PLC-Software][READ-ONLY] Audit standard PLC input uses, caller access, FB/FC pins and direct GRAPH use, including software units. Safety program blocks are excluded. Requires a PLC software path and inclusive input ranges.")]
         public static ResponseJsonReport AuditPlcInputUsage(
             [Description("PLC Software object path from GetProjectTree")] string softwarePath,
             [Description("Inclusive ranges, e.g. [\"%I0.0..%I1.7\", \"%IW8..%ID12\"]; a single address is allowed")] string[] addressRanges,
@@ -18,12 +18,18 @@ namespace TiaMcpServer.ModelContextProtocol
             [Description("Require every executable reference to use the configured block and read-only access")] bool fbRuleEnabled = true,
             [Description("Required block type (FB, FC or OB)")] string requiredBlockType = "FB",
             [Description("Required block number")] int requiredBlockNumber = 81,
-            [Description("Required block programming language")] string requiredLanguage = "LAD")
+            [Description("Required caller block programming language")] string requiredLanguage = "LAD",
+            [Description("Require an Input or InOut connection to the configured FB/FC and disallow other FB/FC pin connections")] bool callPinRuleEnabled = false,
+            [Description("Required called block type (FB or FC)")] string? requiredCallBlockType = null,
+            [Description("Required called block number (positive integer)")] int? requiredCallBlockNumber = null,
+            [Description("Required called block name")] string? requiredCallBlockName = null,
+            [Description("Disallow direct input use in GRAPH transitions and permanent pre/post instructions")] bool graphTransitionRuleEnabled = false)
         {
             try
             {
                 var audit = new PlcInputUsageAudit(addressRanges, commentFilterEnabled, commentKeywords,
-                    fbRuleEnabled, requiredBlockType, requiredBlockNumber, requiredLanguage);
+                    fbRuleEnabled, requiredBlockType, requiredBlockNumber, requiredLanguage,
+                    callPinRuleEnabled, requiredCallBlockType, requiredCallBlockNumber, requiredCallBlockName, graphTransitionRuleEnabled);
                 var data = Portal.AuditPlcInputUsage(softwarePath, audit);
                 return new ResponseJsonReport
                 {

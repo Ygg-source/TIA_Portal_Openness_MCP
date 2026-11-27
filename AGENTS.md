@@ -22,5 +22,5 @@
 
 ## TIA version baseline
 
-- TIA Portal V20 is the supported build and regression baseline. V21 is out of scope unless the user requests it.
+- TIA Portal V20 is the sole baseline for development, builds, deployments, and acceptance. Apply the same V20 build and regression checks to future upstream syncs. Work on other TIA versions requires an explicit change to the version scope from the user.
 - After each V20 build or deployment, register the exact executable that will connect to TIA Portal in the Siemens Openness V20 whitelist before its first connection. Follow the TIABroX `tools/Register-Openness.ps1` procedure: use the 64-bit `HKLM\SOFTWARE\Siemens\Automation\Openness\20.0\Whitelist` registry, update the entry for that full executable path, and read back its path, UTC modification time and Base64 SHA-256. Use an already elevated shell and preserve the entries for other paths and applications, Windows groups and security policies.

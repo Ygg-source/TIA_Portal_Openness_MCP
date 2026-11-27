@@ -76,8 +76,211 @@ namespace TiaMcpServer.Tests
                 "I audit: full inventory above the GetPlcTags result cap");
 
             ScanAbsolute(check);
+            CheckCallPins(check);
+            CheckGraph(check);
+            CheckSafetyAndCounts(check);
             check(ToolSafety.Classify("AuditPlcInputUsage").ReadOnly, "I audit: read-only policy");
         }
+
+        private static void CheckCallPins(Action<bool, string> check)
+        {
+            const string flg = """
+                <FlgNet xmlns="http://www.siemens.com/automation/Openness/SW/NetworkSource/FlgNet/v5">
+                  <Parts>
+                    <Access Scope="GlobalVariable" UId="1"><Symbol><Component Name="Input.Tag"/></Symbol></Access>
+                    <Access Scope="Address" UId="2"><Address Area="Input" Type="Bool" BitOffset="1"/></Access>
+                    <Call UId="3"><CallInfo Name="Target" BlockType="FB">
+                      <Instance Scope="GlobalVariable" UId="6"><Component Name="TargetInstance"/></Instance>
+                      <Parameter Name="a" Section="Input"/><Parameter Name="b" Section="InOut"/>
+                    </CallInfo></Call>
+                    <Call UId="4"><CallInfo Name="Peer" BlockType="FC">
+                      <Parameter Name="a" Section="Input"/><Parameter Name="b" Section="InOut"/>
+                      <Parameter Name="c" Section="Output"/><Parameter Name="r" Section="Return"/>
+                    </CallInfo></Call>
+                    <Part Name="Contact" UId="5"/>
+                  </Parts>
+                  <Wires>
+                    <Wire><IdentCon UId="1"/><NameCon UId="3" Name="a"/><NameCon UId="4" Name="a"/></Wire>
+                    <Wire><IdentCon UId="1"/><NameCon UId="3" Name="b"/></Wire>
+                    <Wire><IdentCon UId="1"/><NameCon UId="5" Name="operand"/></Wire>
+                    <Wire><IdentCon UId="2"/><NameCon UId="4" Name="b"/></Wire>
+                    <Wire><NameCon UId="4" Name="c"/><IdentCon UId="2"/></Wire>
+                    <Wire><NameCon UId="4" Name="r"/><IdentCon UId="2"/></Wire>
+                    <Wire><IdentCon UId="2"/><NameCon UId="4" Name="unknown"/></Wire>
+                  </Wires>
+                </FlgNet>
+                """;
+            var issues = new List<string>();
+            var uses = PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit(flg) + "</Document>"), issues);
+            var symbolic = uses.Single(u => u.Symbol != null);
+            var absolute = uses.Single(u => u.Absolute);
+            check(issues.Count == 0 && symbolic.Symbol!.SequenceEqual(new[] { "Input.Tag" }) && symbolic.Pins.Count == 3
+                && symbolic.Access == "RW" && absolute.Span.Canonical == "%I0.1" && absolute.Pins.Count == 4,
+                "I audit: preserve every call and pin in the network for scoped symbols and absolute operands");
+            check(symbolic.Pins[0].BlockName == "Target" && symbolic.Pins[0].InstanceName == "TargetInstance"
+                && symbolic.Pins[0].InstanceScope == "GlobalVariable", "I audit: distinguish FB type and instance");
+            foreach (var (section, kind) in new[] { ("Static", "MultiInstance"), ("InOut", "ParameterInstance") })
+            {
+                var local = flg.Replace("Instance Scope=\"GlobalVariable\"", "Instance Scope=\"LocalVariable\"");
+                var xml = $"<SW.Blocks.FB><AttributeList><Interface><Sections><Section Name=\"{section}\">"
+                    + """<Member Name="TargetInstance" Datatype="&quot;Target&quot;"/>"""
+                    + "</Section></Sections></Interface></AttributeList>" + Unit(local) + "</SW.Blocks.FB>";
+                var pin = PlcInputSimaticMl.Scan(XDocument.Parse(xml), issues).First().Pins.First();
+                check(pin.InstanceKind == kind && pin.BlockName == "Target" && pin.InstanceTypeName == "\"Target\"",
+                    $"I audit: resolve {kind} using its caller interface declaration");
+            }
+            foreach (var pin in symbolic.Pins.Concat(absolute.Pins)) pin.BlockNumber = pin.BlockType == "FB" ? 82 : 7;
+
+            foreach (var pin in symbolic.Pins.Concat(absolute.Pins).Where(p => p.Direction is "Input" or "InOut"))
+            {
+                var use = Ref("FB", 81, "LAD", pin.Direction == "InOut" ? "RW" : "Read");
+                use.CallPins.Add(pin);
+                var point = Point("Tag", "%I0.0", use, Ref("FB", 81, "LAD", "Read"));
+                var row = Row(Report(AuditRules(pin.BlockType, pin.BlockNumber, pin.BlockName, caller: true), point), "Tag");
+                check(row["callPinRuleStatus"]!.ToString() == "PASS"
+                    && row["callerRuleStatus"]!.ToString() == (pin.Direction == "InOut" ? "FAIL" : "PASS"),
+                    $"I audit: {pin.BlockType} {pin.Direction} is accepted by pin rule independently of caller access");
+                var independent = Row(Report(AuditRules(pin.BlockType, pin.BlockNumber, pin.BlockName), point), "Tag");
+                check(Status(independent) == "PASS" && independent["callerRuleStatus"]!.ToString() == "NOT_EVALUATED",
+                    "I audit: disabling caller rule preserves the pin decision");
+            }
+            foreach (var pin in absolute.Pins.Where(p => p.Direction is not ("Input" or "InOut")))
+            {
+                var use = Ref("FB", 81, "LAD", "Read");
+                use.CallPins.Add(pin);
+                var row = Row(Report(AuditRules("FC", 7, "Peer"), Point("Tag", "%I0.1", use)), "Tag");
+                check(Status(row) == (pin.Direction == null ? "INCOMPLETE" : "FAIL"), "I audit: Output, Return and unknown directions");
+            }
+            var fb = Ref("FB", 81, "LAD", "Read");
+            fb.CallPins.Add(symbolic.Pins[0]);
+            var tag = Point("Tag", "%I0.0", fb);
+            foreach (var audit in new[] { AuditRules("FC", 82, "Target"), AuditRules("FB", 83, "Target"), AuditRules("FB", 82, "Other") })
+                check(Status(Row(Report(audit, tag), "Tag")) == "FAIL", "I audit: call type, number and name all required");
+            fb.CallPins.Add(symbolic.Pins[1]);
+            check(Status(Row(Report(AuditRules("FB", 82, "Target"), tag), "Tag")) == "FAIL", "I audit: correct and wrong target on same input fail");
+            check(Status(Row(Report(AuditRules(null, null, null, pins: false, caller: true), tag), "Tag")) == "PASS",
+                "I audit: disabled pin rule does not affect caller result");
+            check(Status(Row(Report(AuditRules("FB", 82, "Target"), Point("Contact", "%I0.0", Ref("FB", 81, "LAD", "Read"))), "Contact")) == "FAIL",
+                "I audit: complete scan with only a contact has no required pin");
+            bool invalid = false;
+            try { AuditRules("OB", 0, null); }
+            catch (ArgumentException) { invalid = true; }
+            check(invalid, "I audit: enabled call-pin rule rejects missing or invalid target parameters");
+
+            const string scl = """
+                <StructuredText><Access Scope="Call"><CallInfo BlockType="FC">
+                  <Instance Scope="GlobalVariable"><Component Name="DeviceStatus"/></Instance><Token Text="("/>
+                  <Parameter Name="value"><Token Text="=&gt;"/>
+                    <Access Scope="Address"><Address Area="Input" Type="Bool" BitOffset="1"/></Access>
+                  </Parameter><Token Text=")"/>
+                </CallInfo></Access><Token Text=";"/></StructuredText>
+                """;
+            var sclUse = PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit(scl) + "</Document>"), issues).Single();
+            check(sclUse.Confirmed && sclUse.Span.Canonical == "%I0.1" && sclUse.Access == "Write"
+                && sclUse.Pins.Single().Direction == "Output" && sclUse.Pins.Single().BlockName == "DeviceStatus",
+                "I audit: direct SCL output to an absolute input with a V20 FC call encoded as Instance");
+            var expression = scl.Replace("=&gt;", ":=").Replace("</Parameter>", """
+                <Token Text="OR"/><Access Scope="GlobalVariable">
+                  <Symbol><Component Name="Intermediate"/></Symbol>
+                </Access></Parameter>
+                """);
+            var expressionUses = PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit(expression) + "</Document>"), issues);
+            check(expressionUses.Any(u => u.Absolute && u.Confirmed) && expressionUses.All(u => u.Pins.Count == 0),
+                "I audit: SCL expression operands are uses but do not count as direct pin connections");
+            var callee = XDocument.Parse("""
+                <Document><SW.Blocks.FC><AttributeList><Interface><Sections>
+                  <Section Name="InOut"><Member Name="value" Datatype="Bool"/></Section>
+                </Sections></Interface></AttributeList></SW.Blocks.FC></Document>
+                """);
+            check(PlcInputSimaticMl.ReadPinDirections(callee)["value"].Single() == "InOut",
+                "I audit: use callee interface to distinguish SCL InOut from Input when the parameter carries no Section");
+        }
+
+        private static void CheckGraph(Action<bool, string> check)
+        {
+            const string operand = """<Access UId="1" Scope="Address"><Address Area="Input" Type="Bool" BitOffset="0"/></Access>""";
+            const string symbol = """<Access UId="1" Scope="GlobalVariable"><Symbol><Component Name="DirectInput"/></Symbol></Access>""";
+            const string contact = """<Part UId="2" Name="Contact"/>""";
+            const string call = """<Call UId="2"><CallInfo BlockType="FC" Name="Target"><Parameter Name="in" Section="Input"/></CallInfo></Call>""";
+            string Net(string access, string part, string pin) => "<FlgNet><Parts>" + access + part
+                + $$"""</Parts><Wires><Wire><IdentCon UId="1"/><NameCon UId="2" Name="{{pin}}"/></Wire></Wires></FlgNet>""";
+            var graph = """<Graph xmlns="http://www.siemens.com/automation/Openness/SW/NetworkSource/Graph/v6">"""
+                + "<PreOperations><PermanentOperation>" + Net(operand, contact, "operand") + "</PermanentOperation></PreOperations>"
+                + "<Sequence><Steps><Step Number=\"1\"><Actions><Action>" + operand + "</Action></Actions></Step></Steps>"
+                + "<Transitions><Transition Name=\"Ready\" Number=\"42\">" + Net(symbol, contact, "operand")
+                + """</Transition><Transition Name="Intermediate" Number="43">"""
+                + Net(symbol.Replace("DirectInput", "Intermediate"), contact, "operand")
+                + "</Transition></Transitions></Sequence><PostOperations><PermanentOperation>" + Net(operand, call, "in")
+                + "</PermanentOperation></PostOperations></Graph>";
+            var issues = new List<string>();
+            var uses = PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit(graph) + "</Document>"), issues);
+            var direct = uses.Where(u => u.Absolute || u.Symbol!.Single() == "DirectInput").ToList();
+            check(issues.Count == 0 && direct.Select(u => u.GraphRegion).SequenceEqual(new[]
+                { "PermanentPreInstructions", "PermanentPostInstructions", "Transition", null })
+                && direct[1].Pins.Single().Direction == "Input" && direct[2].TransitionNumber == 42,
+                "I audit: V20 GRAPH regions and call operands, exclude indirect intermediate and step action from GRAPH violations");
+            var point = Point("DirectInput", "%I0.0", direct.Select(u =>
+            {
+                var reference = Ref("FB", 81, "GRAPH", u.Access);
+                reference.Location = u.Site;
+                reference.GraphRegion = u.GraphRegion;
+                reference.TransitionNumber = u.TransitionNumber;
+                return reference;
+            }).ToArray());
+            var graphAudit = AuditRules(null, null, null, pins: false, graph: true);
+            var row = Row(Report(graphAudit, point), "DirectInput");
+            check(Status(row) == "FAIL" && row["graphLocations"]!.AsArray().Count == 3, "I audit: GRAPH returns three positions for one input");
+            check(Status(Row(Report(graphAudit, Point("Step", "%I0.1", point.References.Last())), "Step")) == "PASS",
+                "I audit: step use is outside GRAPH rule");
+            check(Status(Row(Report(graphAudit, Point("NoGraph", "%I0.0", Ref("FB", 81, "LAD", "Read"))), "NoGraph")) == "PASS",
+                "I audit: a project without GRAPH can complete the GRAPH rule");
+            var brokenGraph = graph.Replace("Number=\"42\"", "Number=\"invalid\"");
+            var broken = PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit(brokenGraph) + "</Document>"), issues);
+            check(issues.Count != 0 && broken.Any(u => u.GraphRegion == "PermanentPostInstructions"),
+                "I audit: malformed GRAPH region is reported without losing other positions");
+            var partial = graphAudit.Summarize(new[] { point }, issues, true, true, graphScanComplete: false);
+            check(Status(Row(partial, "DirectInput")) == "FAIL" && !partial["complete"]!.GetValue<bool>(),
+                "I audit: keep GRAPH violation with partial coverage");
+        }
+
+        private static void CheckSafetyAndCounts(Action<bool, string> check)
+        {
+            var blocks = new[] { ("LAD", false), ("F_LAD", false), ("F_FBD", false), ("F_DB", false),
+                ("F_CALL", false), ("SCL", true), ("Undef", false) };
+            var kinds = blocks.Select(b => PlcInputUsageAudit.ClassifyProgram(b.Item1, b.Item2)).ToArray();
+            var exports = kinds.Where(kind => PlcInputUsageAudit.CanExport(kind, true)).ToList();
+            check(exports.SequenceEqual(new[] { PlcInputProgramKind.Standard }) && kinds[6] == PlcInputProgramKind.Unknown,
+                "I audit: only standard code can reach export, including standard code on an F-CPU");
+            var used = Point("Mixed", "%I0.0", Ref("FC", 7, "GRAPH", "RW"), Ref("FC", 7, "GRAPH", "Read"));
+            used.HasSafetyUse = true;
+            used.References[0].GraphRegion = "Transition";
+            var only = Point("SafetyOnly", "%I0.1");
+            only.HasSafetyUse = true;
+            var incomplete = Point("Unresolved", "%I0.2");
+            incomplete.ReferencesComplete = false;
+            var audit = AuditRules("FB", 82, "Target", caller: true, graph: true);
+            var report = Report(audit, used, only, incomplete);
+            check(report["checkedInputCount"]!.GetValue<int>() == 2 && report["failCount"]!.GetValue<int>() == 1
+                && report["unconfirmedCount"]!.GetValue<int>() == 1 && report["safetyOnlyExcludedCount"]!.GetValue<int>() == 1
+                && report["ruleViolationCounts"]!["caller"]!.GetValue<int>() == 1 && report["ruleViolationCounts"]!["graphDirectUse"]!.GetValue<int>() == 1
+                && Row(report, "SafetyOnly")["complete"]!.GetValue<bool>() && Row(report, "SafetyOnly")["safetyOnlyExcluded"]!.GetValue<bool>()
+                && Status(Row(report, "SafetyOnly")) == "UNUSED", "I audit: exclusive safety-only count with the legacy row status");
+            used.ReferencesComplete = false;
+            report = Report(audit, used);
+            check(report["failCount"]!.GetValue<int>() == 1 && report["unconfirmedCount"]!.GetValue<int>() == 0
+                && report["partiallyUnconfirmedCount"]!.GetValue<int>() == 1 && report["legacyUnconfirmedCount"]!.GetValue<int>() == 1,
+                "I audit: a failed point with partial evidence is only one checked input");
+            report = AuditRules(null, null, null, pins: false).Summarize(new[] { only }, Array.Empty<string>(), false, true);
+            check(Status(Row(report, "SafetyOnly")) == "INCOMPLETE", "I audit: unclassified inventory precludes a safety-only conclusion");
+            report = Report(AuditRules(null, null, null, pins: false), Point("Used", "%I0.0", Ref("FB", 81, "LAD", "Read")));
+            check(report["notEvaluatedCount"]!.GetValue<int>() == 1 && report["passCount"]!.GetValue<int>() == 0,
+                "I audit: all usage rules disabled");
+        }
+
+        private static PlcInputUsageAudit AuditRules(string? type, int? number, string? name, bool pins = true,
+            bool caller = false, bool graph = false)
+            => new PlcInputUsageAudit(new[] { "%I0.0..%I2.7" }, false, null, caller, "FB", 81, "LAD",
+                pins, type, number, name, graph);
 
         private static void ScanAbsolute(Action<bool, string> check)
         {
