@@ -122,6 +122,10 @@ namespace TiaMcpServer.Tests
             var sameOperandWrite = PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit(flg.Replace("Contact", "Coil")) + "</Document>"), issues);
             check(!symbolic.HasOtherWrite && sameOperandWrite.Single(u => u.Symbol != null).HasOtherWrite,
                 "I audit: identify ordinary write wires beside a direct InOut connection");
+            var mixedNetworkIssues = new List<string>();
+            var mixedNetworks = PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit(flg) + Unit("<StatementList/>") + "</Document>"), mixedNetworkIssues);
+            check(mixedNetworkIssues.Count == 1 && mixedNetworks.All(u => u.NetworkScanComplete),
+                "I audit: an unsupported later network does not invalidate parsed InOut evidence");
             foreach (var (section, kind) in new[] { ("Static", "MultiInstance"), ("InOut", "ParameterInstance") })
             {
                 var local = flg.Replace("Instance Scope=\"GlobalVariable\"", "Instance Scope=\"LocalVariable\"");
@@ -150,8 +154,9 @@ namespace TiaMcpServer.Tests
             var directInOut = Ref("FB", 81, "LAD", "RW");
             directInOut.Origin = "simaticML";
             directInOut.Symbol = "Tag";
+            directInOut.SymbolComponents = new[] { "Tag" };
             directInOut.Network = 1;
-            directInOut.BlockScanComplete = true;
+            directInOut.NetworkScanComplete = true;
             directInOut.CallPins.Add(symbolic.Pins.Single(p => p.Direction == "InOut"));
             var nativeInOut = Ref("FB", 81, "LAD", "ReadWriteAndSymbol");
             nativeInOut.Network = 1;
@@ -159,6 +164,15 @@ namespace TiaMcpServer.Tests
             var callerOnly = AuditRules(null, null, null, pins: false, caller: true);
             check(Status(Row(Report(callerOnly, inOutPoint), "Tag")) == "PASS",
                 "I audit: reconcile a native read/write reference with the verified InOut operation in the same network");
+            directInOut.Symbol = "Tag.Field";
+            directInOut.SymbolComponents = new[] { "Tag", "Field" };
+            nativeInOut.Symbol = "\"Tag\".\"Field\"";
+            check(Status(Row(Report(callerOnly, inOutPoint), "Tag")) == "PASS",
+                "I audit: reconcile a quoted native field with its exact XML symbol components");
+            directInOut.NetworkScanComplete = false;
+            check(Status(Row(Report(callerOnly, inOutPoint), "Tag")) == "INCOMPLETE",
+                "I audit: unverified native attribution is not a confirmed write violation");
+            directInOut.NetworkScanComplete = true;
             directInOut.HasOtherWrite = true;
             check(Status(Row(Report(callerOnly, inOutPoint), "Tag")) == "FAIL",
                 "I audit: an ordinary write on the same operand remains a violation");

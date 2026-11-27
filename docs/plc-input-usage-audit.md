@@ -25,7 +25,7 @@
 
 ## 检查规则
 
-- 调用者访问规则由 `fbRuleEnabled` 控制，默认要求所有参与审计的普通程序引用出现在 LAD FB81。`Read`、`ReadAndSymbol` 以及可归因到已确认 `InOut` 直连的读写访问满足要求。其他写入继续判违规，未知访问类型影响完整性。
+- 调用者访问规则由 `fbRuleEnabled` 控制，默认要求所有参与审计的普通程序引用出现在 LAD FB81。`Read`、`ReadAndSymbol` 以及可归因到已确认 `InOut` 直连的读写访问满足要求。如果原生写入可能来自该连接但无法核实归属，报告会注明无法确认。其他写入继续判违规，未知访问类型影响完整性。
 - FB/FC 引脚规则由 `callPinRuleEnabled` 控制，默认关闭。启用时必须提供 `requiredCallBlockType`（`FB` 或 `FC`）、正整数 `requiredCallBlockNumber` 和非空 `requiredCallBlockName`。完整检查要求每点至少有一个目标块的 `Input` 或 `InOut` 直连。其他 FB/FC 的引脚以及 `Output`、`Return` 均判为违规。Contact 等普通读取位置仍适用调用者规则。
 - GRAPH 直接使用规则由 `graphTransitionRuleEnabled` 控制，默认关闭。该字段覆盖转换条件、前固定指令和后固定指令。直接使用 I 点符号或绝对地址的操作数及调用实参均判为违规。步骤动作、联锁、监控仍适用已启用的调用者及引脚规则。
 
@@ -35,7 +35,7 @@
 
 ## 结果
 
-可在用户 JSON 的 `scope.skipFbBlocks` 填写编号和名称的混合数组，例如 `[81, 120, "Feedback_Check"]`。读取脚本将它映射成 MCP 的 `skipFbNumbers` 和 `skipFbNames`。匹配编号或完整名称（忽略大小写）的普通 FB 将从调用者扫描和用法统计中排除。其元数据仍可用于识别其他块中的调用。
+可在用户 JSON 的 `scope.skipFbBlocks` 填写编号和名称的混合数组，例如 `[81, 120, "Feedback_Check"]`。读取脚本将它映射成 MCP 的 `skipFbNumbers` 和 `skipFbNames`。匹配编号或完整名称（忽略大小写）的普通 FB 将从调用者扫描和用法统计中排除。其他块调用这些 FB 且调用位置缺少引脚方向时，会按需导出接口元数据以确认该外部用法。
 
 全量响应超过 MCP 会话阈值时，返回 `exportId`。在同一会话用 `GetExport` 从偏移量 0 开始获取所有字符切片，按 `nextOffset` 读到 `eof=true`，拼接后再解析 JSON。审计只执行一次。
 

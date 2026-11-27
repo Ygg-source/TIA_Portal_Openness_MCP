@@ -14,6 +14,7 @@ namespace TiaMcpServer.Siemens
         internal string Access { get; set; } = "Unknown";
         internal bool AccessComplete { get; set; } = true;
         internal bool HasOtherWrite { get; set; }
+        internal bool NetworkScanComplete { get; set; } = true;
         internal int Network { get; set; }
         internal string Site { get; set; } = "";
         internal bool Confirmed { get; set; }
@@ -46,6 +47,7 @@ namespace TiaMcpServer.Siemens
                     continue;
                 }
                 var content = source.Elements().ToList();
+                int firstOperand = operands.Count, ordinaryIssueCount = issues.Count, graphIssueCount = graphIssues.Count;
                 if (content.Count == 0 && !string.IsNullOrWhiteSpace(source.Value))
                     issues.Add($"NW{network}: unstructured NetworkSource");
                 foreach (var body in content)
@@ -60,6 +62,9 @@ namespace TiaMcpServer.Siemens
                         issues.Add($"NW{network}: unsupported network format {body.Name.LocalName}");
                     ScanBody(body, network, $"NW{network}", operands, issues);
                 }
+                if (issues.Count != ordinaryIssueCount || graphIssues.Count != graphIssueCount)
+                    for (int operand = firstOperand; operand < operands.Count; operand++)
+                        operands[operand].NetworkScanComplete = false;
             }
             if (expectGraph && !hasGraph) graphIssues.Add("GRAPH NetworkSource was not available");
             return operands;
@@ -314,7 +319,12 @@ namespace TiaMcpServer.Siemens
         internal static ILookup<string, string> ReadPinDirections(XDocument xml)
         {
             var block = xml.Descendants().FirstOrDefault(e => e.Name.LocalName is "SW.Blocks.FB" or "SW.Blocks.FC");
-            var sections = Child(Child(Child(block, "AttributeList"), "Interface"), "Sections");
+            return ReadInterfacePinDirections(Child(Child(block, "AttributeList"), "Interface"));
+        }
+
+        internal static ILookup<string, string> ReadInterfacePinDirections(XElement? blockInterface)
+        {
+            var sections = Child(blockInterface, "Sections");
             return (sections?.Elements().Where(e => Is(e, "Section")) ?? Enumerable.Empty<XElement>())
                 .SelectMany(s => s.Elements().Where(m => Is(m, "Member") && m.Attribute("Name") != null)
                     .Select(m => (Name: (string)m.Attribute("Name")!, Direction: (string?)s.Attribute("Name"))))

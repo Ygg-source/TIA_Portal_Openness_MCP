@@ -102,7 +102,7 @@ namespace TiaMcpServer.Siemens
         internal string? Access { get; set; }
         internal bool AccessComplete { get; set; } = true;
         internal bool HasOtherWrite { get; set; }
-        internal bool BlockScanComplete { get; set; }
+        internal bool NetworkScanComplete { get; set; }
         internal string? Location { get; set; }
         internal string? Detail { get; set; }
         internal string? Address { get; set; }
@@ -112,6 +112,7 @@ namespace TiaMcpServer.Siemens
         internal int? Network { get; set; }
         internal string? BlockName { get; set; }
         internal string? Symbol { get; set; }
+        internal string[]? SymbolComponents { get; set; }
         internal string? GraphRegion { get; set; }
         internal string? TransitionName { get; set; }
         internal int? TransitionNumber { get; set; }
@@ -248,19 +249,36 @@ namespace TiaMcpServer.Siemens
             => (r.BlockPath, r.Network, r.Address, IsRead(r.Access) ? "Read" : r.Access == "WriteAndSymbol" ? "Write"
                 : r.Access == "ReadWriteAndSymbol" ? "RW" : r.Access);
 
-        private static bool InOutWriteAllowed(PlcInputAuditReference reference,
-            ILookup<(string?, int?, bool), PlcInputAuditReference> xmlByNetwork, string? pointName)
+        internal static bool NativeSymbolMatches(string? native, string[] components)
         {
-            if (reference.IsDirectInOutWrite) return true;
+            if (string.IsNullOrWhiteSpace(native)) return false;
+            var pattern = string.Join(@"\.", components.Select(component =>
+            {
+                var quoted = Regex.Escape("\"" + component.Replace("\"", "\"\"") + "\"");
+                return component.IndexOfAny(new[] { '.', '"', '[' }) < 0
+                    ? "(?:" + quoted + "|" + Regex.Escape(component) + ")" : quoted;
+            }));
+            return Regex.IsMatch(native!, "\\A" + pattern + "\\z", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        }
+
+        private static (bool Allowed, bool Unconfirmed) InOutWriteAssessment(PlcInputAuditReference reference,
+            ILookup<(string?, bool), PlcInputAuditReference> xmlByBlock, string? pointName)
+        {
+            if (reference.IsDirectInOutWrite) return (true, false);
             // Native references can summarize a network rather than identify the individual wire.
-            if (reference.Origin != "crossReference" || !IsWrite(reference.Access) || !reference.Network.HasValue
-                || reference.BlockPath == null || reference.Language == "GRAPH") return false;
-            var operands = xmlByNetwork[(reference.BlockPath, reference.Network, reference.Absolute)].ToList();
-            return operands.Any(r => r.IsDirectInOutWrite) && operands.All(r => r.BlockScanComplete && r.ConfirmedUsage
-                && r.AccessComplete && (IsRead(r.Access) || r.IsDirectInOutWrite)
-                && (reference.Absolute ? reference.Address == r.Address
-                    : string.Equals(string.IsNullOrEmpty(reference.Symbol) ? pointName : reference.Symbol?.Trim('"'),
-                        r.Symbol, StringComparison.OrdinalIgnoreCase)));
+            if (reference.Origin != "crossReference" || !IsWrite(reference.Access) || reference.BlockPath == null) return default;
+            var networkKnown = reference.Network.HasValue && reference.Language != "GRAPH";
+            var operands = xmlByBlock[(reference.BlockPath, reference.Absolute)]
+                .Where(r => !networkKnown || reference.Network == r.Network)
+                .Where(r => reference.Absolute ? reference.Address == r.Address : r.SymbolComponents is { } components
+                    && (string.IsNullOrEmpty(reference.Symbol)
+                        ? components.Length == 1 && string.Equals(pointName, components[0], StringComparison.OrdinalIgnoreCase)
+                        : NativeSymbolMatches(reference.Symbol, components))).ToList();
+            if (!operands.Any(r => r.IsDirectInOutWrite)
+                || operands.Any(r => r.ConfirmedUsage && IsWrite(r.Access) && !r.IsDirectInOutWrite)) return default;
+            var complete = networkKnown && operands.All(r => r.NetworkScanComplete && r.ConfirmedUsage && r.AccessComplete
+                && (IsRead(r.Access) || r.IsDirectInOutWrite));
+            return (complete, !complete);
         }
 
         internal JsonObject Summarize(IEnumerable<PlcInputAuditPoint> points, IEnumerable<string> warnings,
@@ -280,8 +298,8 @@ namespace TiaMcpServer.Siemens
                 if (point.Table == null) absoluteOnly++;
                 else tags++;
                 var references = DistinctReferences(point.References);
-                var xmlByNetwork = references.Where(r => r.Origin == "simaticML")
-                    .ToLookup(r => (r.BlockPath, r.Network, r.Absolute));
+                var xmlByBlock = references.Where(r => r.Origin == "simaticML")
+                    .ToLookup(r => (r.BlockPath, r.Absolute));
                 var allowedInOut = new HashSet<PlcInputAuditReference>();
                 var hasUse = references.Any(r => r.ConfirmedUsage);
                 var reasons = new List<string>();
@@ -328,7 +346,7 @@ namespace TiaMcpServer.Siemens
                 foreach (var reference in references)
                 {
                     var site = (reference.BlockPath ?? "(unresolved user)") + " " + reference.Location;
-                    var inOutAllowed = InOutWriteAllowed(reference, xmlByNetwork, point.Name);
+                    var (inOutAllowed, inOutUnconfirmed) = InOutWriteAssessment(reference, xmlByBlock, point.Name);
                     if (inOutAllowed) allowedInOut.Add(reference);
                     if (!excluded && !reference.ConfirmedUsage)
                         reasons.Add($"{site}: the usage could not be confirmed.");
@@ -346,7 +364,12 @@ namespace TiaMcpServer.Siemens
                             callerComplete = false;
                             reasons.Add($"{site}: the caller block properties could not be confirmed.");
                         }
-                        if (IsWrite(reference.Access) && !inOutAllowed)
+                        if (inOutUnconfirmed)
+                        {
+                            callerComplete = false;
+                            reasons.Add($"{site}: the native write could not be attributed exclusively to the verified InOut connection.");
+                        }
+                        else if (IsWrite(reference.Access) && !inOutAllowed)
                         {
                             callerFail = true;
                             Violation("caller", "NOT_READ_ONLY", $"{site}: {reference.Access} is not read-only.", reference);

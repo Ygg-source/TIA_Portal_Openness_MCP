@@ -12,6 +12,7 @@ using System.IO;
 using System.Linq;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using System.Xml;
 using System.Xml.Linq;
 using TiaMcpServer.ModelContextProtocol;
 
@@ -228,7 +229,7 @@ namespace TiaMcpServer.Siemens
             }
 
             int xmlScanned = 0, xmlFailures = 0, xmlUnsupported = 0, absoluteOccurrences = 0, graphScanned = 0, graphFailures = 0;
-            int xmlExportAttempts = 0, safetyXmlExportAttempts = 0;
+            int xmlExportAttempts = 0, safetyXmlExportAttempts = 0, skippedInterfaceExportAttempts = 0;
             var unreadableBlocks = new JsonArray();
             var incompleteBlocks = new JsonArray();
             var codeTargets = blocks.Values.Where(b => b.Kind == PlcInputProgramKind.Standard && b.Type is "FB" or "FC")
@@ -245,6 +246,36 @@ namespace TiaMcpServer.Siemens
             var temp = Path.Combine(Path.GetTempPath(), "tia-input-audit-" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(temp);
             var file = new FileInfo(Path.Combine(temp, "block.xml"));
+            var skippedCallees = blocks.Where(p => p.Value.Skipped).ToDictionary(p => p.Value, p => p.Key);
+            var interfaceReads = new HashSet<InputAuditBlock>();
+
+            ILookup<string, string>? ReadSkippedInterface(InputAuditBlock metadata)
+            {
+                if (!skippedCallees.TryGetValue(metadata, out var block) || !interfaceReads.Add(metadata))
+                    return metadata.PinDirections;
+                try
+                {
+                    if (block.IsKnowHowProtected) return null;
+                    skippedInterfaceExportAttempts++;
+                    block.Export(file, ExportOptions.None);
+                    using var xml = XmlReader.Create(file.FullName);
+                    if (xml.ReadToFollowing("Interface"))
+                    {
+                        using var subtree = xml.ReadSubtree();
+                        metadata.PinDirections = PlcInputSimaticMl.ReadInterfacePinDirections(XElement.Load(subtree));
+                    }
+                }
+                catch (Exception ex) when (!PortalFailureClassifier.IsPortalProcessLost(ex))
+                {
+                    warnings.Add($"{metadata.Path}: skipped callee interface could not be read: {ex.Message}");
+                }
+                finally
+                {
+                    if (File.Exists(file.FullName)) File.Delete(file.FullName);
+                }
+                return metadata.PinDirections;
+            }
+
             try
             {
                 foreach (var (block, metadata) in blocks.Where(p => !p.Value.Skipped && PlcInputUsageAudit.CanExport(p.Value.Kind, p.Key is CodeBlock))
@@ -308,7 +339,7 @@ namespace TiaMcpServer.Siemens
                                 if (candidates.Count == 0) continue;
                                 var native = nativeUses[(path, name.ToUpperInvariant())]
                                     .Where(r => (r.Reference.Network == match.Network || r.Reference.Network == null)
-                                        && (NativeSymbolMatches(r.Reference.Symbol, symbol)
+                                        && (PlcInputUsageAudit.NativeSymbolMatches(r.Reference.Symbol, symbol)
                                             || (symbol.Length == 1 && r.Reference.Network == match.Network && string.IsNullOrEmpty(r.Reference.Symbol))))
                                     .ToList();
                                 owners = native.Select(n => n.Point).Distinct().ToList();
@@ -333,9 +364,10 @@ namespace TiaMcpServer.Siemens
                                 BlockPath = path, BlockType = metadata.Type, BlockNumber = metadata.Number, BlockName = metadata.Name,
                                 Language = metadata.Language, Access = access, Location = match.Site, Network = match.Network,
                                 AccessComplete = match.AccessComplete || match.Access == "Unknown" && access != "Unknown",
-                                HasOtherWrite = match.HasOtherWrite, BlockScanComplete = issues.Count == 0,
+                                HasOtherWrite = match.HasOtherWrite, NetworkScanComplete = match.NetworkScanComplete,
                                 Address = match.Absolute ? match.Span.Canonical : null,
                                 Symbol = match.Symbol == null ? null : string.Join(".", match.Symbol),
+                                SymbolComponents = match.Symbol,
                                 Origin = "simaticML", Absolute = match.Absolute, ConfirmedUsage = match.Confirmed,
                                 GraphRegion = match.GraphRegion, GraphSequence = match.GraphSequence,
                                 TransitionName = match.TransitionName, TransitionNumber = match.TransitionNumber,
@@ -362,17 +394,17 @@ namespace TiaMcpServer.Siemens
                         if (File.Exists(file.FullName)) File.Delete(file.FullName);
                     }
                 }
+                foreach (var (reference, resolveAccess) in callReferences)
+                {
+                    foreach (var pin in reference.CallPins)
+                        ResolveInputCallPin(pin, codeTargets, qualifiedTargets, instanceTargets, ReadSkippedInterface);
+                    if (resolveAccess && reference.CallPins.Count == 1 && reference.CallPins[0].Confirmed)
+                        reference.Access = PlcInputSimaticMl.SectionAccess(reference.CallPins[0].Direction);
+                }
             }
             finally
             {
                 Directory.Delete(temp);
-            }
-            foreach (var (reference, resolveAccess) in callReferences)
-            {
-                foreach (var pin in reference.CallPins)
-                    ResolveInputCallPin(pin, codeTargets, qualifiedTargets, instanceTargets);
-                if (resolveAccess && reference.CallPins.Count == 1 && reference.CallPins[0].Confirmed)
-                    reference.Access = PlcInputSimaticMl.SectionAccess(reference.CallPins[0].Direction);
             }
 
             var cpuModel = ReadInputAuditCpuAttribute(cpu, "TypeName", warnings);
@@ -396,6 +428,7 @@ namespace TiaMcpServer.Siemens
                 ["xmlFailedBlocks"] = xmlFailures, ["xmlUnsupportedBlocks"] = xmlUnsupported,
                 ["xmlAbsoluteOccurrences"] = absoluteOccurrences,
                 ["xmlExportAttempts"] = xmlExportAttempts, ["safetyXmlExportAttempts"] = safetyXmlExportAttempts,
+                ["skippedCalleeInterfaceExportAttempts"] = skippedInterfaceExportAttempts,
                 ["graphScannedBlocks"] = graphScanned, ["graphFailedBlocks"] = graphFailures,
                 ["unclassifiedBlocks"] = blocks.Values.Count(b => b.Kind == PlcInputProgramKind.Unknown),
                 ["unreadableBlocks"] = unreadableBlocks, ["incompleteBlocks"] = incompleteBlocks,
@@ -464,20 +497,9 @@ namespace TiaMcpServer.Siemens
 
         private static string RootSymbol(string[] components) => components[0];
 
-        private static bool NativeSymbolMatches(string? native, string[] components)
-        {
-            if (string.IsNullOrWhiteSpace(native)) return false;
-            var pattern = string.Join(@"\.", components.Select(component =>
-            {
-                var quoted = Regex.Escape("\"" + component.Replace("\"", "\"\"") + "\"");
-                return component.IndexOfAny(new[] { '.', '"', '[' }) < 0
-                    ? "(?:" + quoted + "|" + Regex.Escape(component) + ")" : quoted;
-            }));
-            return Regex.IsMatch(native!, "\\A" + pattern + "\\z", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
-        }
-
         private static void ResolveInputCallPin(PlcInputCallPin pin, ILookup<string, InputAuditBlock> targets,
-            ILookup<string, InputAuditBlock> qualifiedTargets, ILookup<string, InputAuditBlock> instances)
+            ILookup<string, InputAuditBlock> qualifiedTargets, ILookup<string, InputAuditBlock> instances,
+            Func<InputAuditBlock, ILookup<string, string>?> readSkippedInterface)
         {
             if (pin.BlockType is not ("FB" or "FC")) return;
             var name = pin.BlockName?.Replace("\"", "") ?? "";
@@ -503,7 +525,8 @@ namespace TiaMcpServer.Siemens
             if (candidates.Count != 1) return;
             pin.BlockName = candidates[0].Name;
             pin.BlockNumber = candidates[0].Number;
-            if (pin.Direction == null && pin.Pin != null && candidates[0].PinDirections is { } directions)
+            if (pin.Direction == null && pin.Pin != null
+                && (candidates[0].PinDirections ?? readSkippedInterface(candidates[0])) is { } directions)
             {
                 var sections = directions[pin.Pin].ToList();
                 if (sections.Count == 1) pin.Direction = sections[0];

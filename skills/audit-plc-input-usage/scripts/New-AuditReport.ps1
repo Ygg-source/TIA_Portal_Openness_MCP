@@ -116,8 +116,8 @@ $coverageLabels = [ordered]@{
     skippedFbBlocks = '按配置跳过的 FB'
 }
 $coverageHtml = foreach ($key in $coverageLabels.Keys) {
-    $blocks = if ($data.coverage) { $data.coverage[$key] }
-    if (-not $blocks) { continue }
+    if (-not $data.coverage -or -not $data.coverage[$key]) { continue }
+    $blocks = $data.coverage[$key]
     $blockRows = foreach ($item in ($blocks | Sort-Object blockType, blockNumber, blockName)) {
         $blockId = '{0}{1}' -f $item.blockType, $item.blockNumber
         $reason = if ($item.issues) { $item.issues -join [Environment]::NewLine } else { $item.reason }
