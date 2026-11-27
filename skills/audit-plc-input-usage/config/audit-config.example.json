@@ -3,12 +3,11 @@
   "plc": { "softwarePath": "" },
   "scope": {
     "inputRanges": [
-      { "start": "%I0.0", "end": "%I15.7" },
-      { "start": "%I32.0", "end": "%I47.7" }
+      { "start": "%I4000.0", "end": "%I4500.0" }
     ]
   },
   "checks": {
-    "commentExclusion": { "enabled": true, "keywords": ["气缸"] },
+    "commentExclusion": { "enabled": true, "keywords": ["气缸", "备用", "预留"] },
     "fbReadOnly": {
       "enabled": true,
       "targetBlockType": "FB",
@@ -17,7 +16,7 @@
     }
   },
   "report": {
-    "outputDirectory": "",
+    "outputDirectory": "D:\\Users\\Administrator\\Desktop\\YGG\\TEMP",
     "fileNamePrefix": "PLC_I点使用情况检查"
   }
 }
