@@ -8,6 +8,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $OutputEncoding = [Console]::OutputEncoding = [Console]::InputEncoding = [Text.UTF8Encoding]::new($false)
 $output = [IO.Path]::GetFullPath($OutputDirectory)
+if ($Package) {
+    $repository = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..')).TrimEnd('\')
+    if ($output.TrimEnd('\') -eq $repository -or $output.StartsWith("$repository\", [StringComparison]::OrdinalIgnoreCase)) {
+        throw '请将 WorkBuddy 分发包输出到 MCP 仓库之外。'
+    }
+}
 [void][IO.Directory]::CreateDirectory($output)
 
 if (-not $Package) {
@@ -27,7 +33,10 @@ if (-not $Package) {
 }
 
 $skillName = 'audit-plc-input-usage'
-$sourceSkill = Join-Path $PSScriptRoot "../skills/$skillName"
+$sourceSkill = Join-Path $env:USERPROFILE ".agents/skills/$skillName"
+if (-not (Test-Path -LiteralPath (Join-Path $sourceSkill 'SKILL.md') -PathType Leaf)) {
+    throw "找不到 Codex 用户级 Skill。$sourceSkill"
+}
 $zip = Join-Path $output 'tia-plc-input-audit-workbuddy.zip'
 if (Test-Path -LiteralPath $zip) { throw "分发包已存在，请另选输出目录。$zip" }
 $stage = New-Item -ItemType Directory -Path (Join-Path $output ('workbuddy-' + [guid]::NewGuid().ToString('N')))

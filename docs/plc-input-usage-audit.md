@@ -1,6 +1,6 @@
 # V20 PLC I 点使用审计
 
-使用 Codex 或 WorkBuddy 自动读取配置并生成中文 HTML 时，参阅 [PLC I 点检查 Skill](../skills/audit-plc-input-usage/README.md)。
+使用 Codex 自动读取配置并生成中文 HTML 时，参阅用户级 Skill 文档 %USERPROFILE%\.agents\skills\audit-plc-input-usage\README.md。WorkBuddy 分发包从同一目录生成。 [WorkBuddy 分发说明](../workbuddy/README.md)
 
 `AuditPlcInputUsage` 是 lite Profile 的只读工具。打开单个工程后，从 `GetProjectTree` 取实际 PLC Software 路径。下面的例子检查两段 I 地址并应用默认规则。
 
