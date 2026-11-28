@@ -122,20 +122,23 @@ namespace TiaMcpServer.Siemens
         internal int? TransitionNumber { get; set; }
         internal int? GraphSequence { get; set; }
         internal List<PlcInputCallPin> CallPins { get; } = new List<PlcInputCallPin>();
+        internal IReadOnlyList<PlcInputCallPin> SimaticMlPins => Origin == "simaticML" ? CallPins : Array.Empty<PlcInputCallPin>();
         internal bool IsDirectInOutWrite => ConfirmedUsage && AccessComplete && !HasOtherWrite
-            && (Access is "RW" or "ReadWriteAndSymbol") && CallPins.Any(p => p.Direction == "InOut")
-            && CallPins.All(p => p.Direction is "Input" or "InOut");
+            && (Access is "RW" or "ReadWriteAndSymbol") && SimaticMlPins.Any(p => p.Direction == "InOut")
+            && SimaticMlPins.All(p => p.Direction is "Input" or "InOut");
 
-        internal JsonObject ToJson(bool inOutWriteAllowed = false) => new JsonObject
+        internal JsonObject ToJson(bool inOutWriteAllowed = false, PlcInputAuditReference? caller = null) => new JsonObject
         {
-            ["blockPath"] = BlockPath, ["blockType"] = BlockType, ["blockNumber"] = BlockNumber,
+            ["blockPath"] = caller?.BlockPath ?? BlockPath, ["blockType"] = caller?.BlockType ?? BlockType,
+            ["blockNumber"] = caller?.BlockNumber ?? BlockNumber, ["blockName"] = caller?.BlockName ?? BlockName,
+            ["callerOrigin"] = caller?.Origin ?? Origin,
             ["language"] = Language, ["access"] = Access, ["location"] = Location, ["detail"] = Detail,
             ["accessComplete"] = AccessComplete && (PlcInputUsageAudit.IsRead(Access) || PlcInputUsageAudit.IsWrite(Access)),
             ["inOutWriteAllowed"] = inOutWriteAllowed,
             ["address"] = Address, ["origin"] = Origin, ["absolute"] = Absolute, ["confirmedUsage"] = ConfirmedUsage,
-            ["network"] = Network, ["blockName"] = BlockName, ["symbol"] = Symbol, ["graphRegion"] = GraphRegion,
+            ["network"] = Network, ["symbol"] = Symbol, ["graphRegion"] = GraphRegion,
             ["transitionName"] = TransitionName, ["transitionNumber"] = TransitionNumber, ["graphSequence"] = GraphSequence,
-            ["callPins"] = new JsonArray(CallPins.Select(p => (JsonNode)p.ToJson()).ToArray()),
+            ["callPins"] = new JsonArray(SimaticMlPins.Select(p => (JsonNode)p.ToJson()).ToArray()),
         };
     }
 
@@ -271,8 +274,46 @@ namespace TiaMcpServer.Siemens
         }
 
         private static (string?, int?, string?, string?) MatchingAbsoluteAccess(PlcInputAuditReference r)
-            => (r.BlockPath, r.Network, r.Address, IsRead(r.Access) ? "Read" : r.Access == "WriteAndSymbol" ? "Write"
-                : r.Access == "ReadWriteAndSymbol" ? "RW" : r.Access);
+            => (r.BlockPath, r.Network, r.Address, AccessKind(r.Access));
+
+        private static string? AccessKind(string? access) => access switch
+        {
+            "ReadAndSymbol" => "Read", "WriteAndSymbol" => "Write", "ReadWriteAndSymbol" => "RW", _ => access,
+        };
+
+        private static bool MatchesSymbol(PlcInputAuditReference native, PlcInputAuditReference operand, string? pointName)
+            => operand.SymbolComponents is { } components && (string.IsNullOrEmpty(native.Symbol)
+                ? components.Length == 1 && string.Equals(pointName, components[0], StringComparison.OrdinalIgnoreCase)
+                : NativeSymbolMatches(native.Symbol, components));
+
+        private static JsonArray ReportReferences(List<PlcInputAuditReference> references,
+            HashSet<PlcInputAuditReference> allowedInOut, string? pointName)
+        {
+            // Keep both sources for rule evaluation. Suppress only a network-level summary
+            // that is represented by a confirmed, matching XML site in the result.
+            var comparable = references.Where(r => !r.Absolute && r.BlockPath != null && r.Network.HasValue
+                && r.Language != "GRAPH" && r.ConfirmedUsage && r.AccessComplete
+                && (IsRead(r.Access) || IsWrite(r.Access)));
+            var operands = comparable.Where(r => r.Origin == "simaticML")
+                .ToLookup(r => (r.BlockPath, r.Network, r.Language, AccessKind(r.Access)));
+            var callerByOperand = new Dictionary<PlcInputAuditReference, PlcInputAuditReference>();
+            var coveredNative = new HashSet<PlcInputAuditReference>();
+            foreach (var native in comparable.Where(r => r.Origin == "crossReference"))
+            {
+                foreach (var operand in operands[(native.BlockPath, native.Network, native.Language, AccessKind(native.Access))])
+                {
+                    if (!MatchesSymbol(native, operand, pointName)) continue;
+                    if (!callerByOperand.ContainsKey(operand)) callerByOperand.Add(operand, native);
+                    coveredNative.Add(native);
+                }
+            }
+
+            return new JsonArray(references.Where(r => !coveredNative.Contains(r)).Select(r =>
+            {
+                callerByOperand.TryGetValue(r, out var caller);
+                return (JsonNode)r.ToJson(allowedInOut.Contains(r), caller);
+            }).ToArray());
+        }
 
         internal static bool NativeSymbolMatches(string? native, string[] components)
         {
@@ -295,10 +336,8 @@ namespace TiaMcpServer.Siemens
             var networkKnown = reference.Network.HasValue && reference.Language != "GRAPH";
             var operands = xmlByBlock[(reference.BlockPath, reference.Absolute)]
                 .Where(r => !networkKnown || reference.Network == r.Network)
-                .Where(r => reference.Absolute ? reference.Address == r.Address : r.SymbolComponents is { } components
-                    && (string.IsNullOrEmpty(reference.Symbol)
-                        ? components.Length == 1 && string.Equals(pointName, components[0], StringComparison.OrdinalIgnoreCase)
-                        : NativeSymbolMatches(reference.Symbol, components))).ToList();
+                .Where(r => reference.Absolute ? reference.Address == r.Address : MatchesSymbol(reference, r, pointName))
+                .ToList();
             if (!operands.Any(r => r.IsDirectInOutWrite)
                 || operands.Any(r => r.ConfirmedUsage && IsWrite(r.Access) && !r.IsDirectInOutWrite)) return default;
             var complete = networkKnown && operands.All(r => r.NetworkScanComplete && r.ConfirmedUsage && r.AccessComplete
@@ -405,7 +444,7 @@ namespace TiaMcpServer.Siemens
                             reasons.Add($"{site}: unconfirmed access ({reference.Access ?? "undefined"}).");
                         }
                     }
-                    foreach (var pin in reference.CallPins)
+                    foreach (var pin in reference.SimaticMlPins)
                     {
                         var connection = pin.ToJson();
                         connection["callerBlockName"] = reference.BlockName;
@@ -467,7 +506,7 @@ namespace TiaMcpServer.Siemens
                 {
                     ["name"] = point.Name, ["address"] = point.Address, ["coveredAddress"] = point.Span.Canonical,
                     ["table"] = point.Table, ["softwareUnit"] = point.SoftwareUnit, ["comment"] = point.Comment.DeepClone(),
-                    ["references"] = new JsonArray(references.Select(r => (JsonNode)r.ToJson(allowedInOut.Contains(r))).ToArray()),
+                    ["references"] = ReportReferences(references, allowedInOut, point.Name),
                     ["callPinConnections"] = pinConnections, ["graphLocations"] = graphLocations,
                     ["status"] = status == "SAFETY_ONLY" ? "UNUSED" : status,
                     ["safetyOnlyExcluded"] = status == "SAFETY_ONLY",

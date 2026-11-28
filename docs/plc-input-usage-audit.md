@@ -54,6 +54,7 @@ STL 的 FB/FC 调用沿用 `callPinConnections`。从 `CallInfo` 获取目标、
 - `checkedInputCount = passCount + failCount + unconfirmedCount + notEvaluatedCount`。每个已使用或无法确认是否使用的审计点计一次。注释排除、确认未使用和确认仅在安全程序使用分别计入 `excludedCount`、`unusedCount` 和 `safetyOnlyExcludedCount`。仅在安全程序使用的明细保留旧状态 `UNUSED`，以 `safetyOnlyExcluded: true` 区分。尚未确认普通程序覆盖时，已发现安全引用的点仍可能计入检测总数。
 - 新版 `unconfirmedCount` 只统计综合状态为 `INCOMPLETE` 的点。已确认违规且存在覆盖不足的点计入 `failCount` 和 `partiallyUnconfirmedCount`。需要原有重叠口径的直接调用方可读取 `legacyUnconfirmedCount`。按规则分别违反的点数见 `ruleViolationCounts`。安全块总跳过数见 `safetySkippedBlockCount`，导出尝试数见 `coverage.xmlExportAttempts` 和 `coverage.safetyXmlExportAttempts`。
 - `points` 返回变量身份、注释、`references`、`callPinConnections`、`graphLocations`、`violations`、`reasons` 和 `complete`。`callerRuleStatus` 亦保留为旧字段 `ruleStatus`。其余状态分别见 `callPinRuleStatus` 和 `graphDirectUseStatus`。引脚连接包含调用者、网络、被调用块、实例、引脚、方向及确认状态。GRAPH 位置包含区域、网络、转换名和编号（适用时）、输入点及确认状态。
+- 调用者 A 优先取 TIA 交叉引用，被调用 FB/FC、引脚和方向取 SimaticML。`references` 将已确认属于同一块、网络、符号和访问类型的交叉引用摘要归并到各 XML 位置。`origin` 表示位置和操作数的来源，`callerOrigin` 表示调用者身份的来源。没有对应交叉引用的 XML 位置继续使用已核实的块身份。不同 XML 位置、各实际引脚连接和无法可靠对应的记录均保留。合并用于结果展示，检查规则继续使用原证据。
 - `uncertaintyReasons` 单列影响确认的原因。引用的 `inOutWriteAllowed` 标记按 `InOut` 允许的访问。`coverage.unreadableBlocks`、`coverage.incompleteBlocks` 和 `coverage.skippedFbBlocks` 返回对应的块名称、类型和编号，前两项附带失败原因或网络解析问题。
 - 已确认违规的点和总体结果优先返回 `FAIL`，同时保留 `complete: false`、`coverage` 和 `warnings`。其余结果在不完整时为 `INCOMPLETE`。全部程序规则关闭且检查完整时为 `NOT_EVALUATED`。规则开启且确认没有普通程序用法时为 `UNUSED`。完整满足启用的规则时为 `PASS`。
 

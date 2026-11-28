@@ -77,6 +77,7 @@ namespace TiaMcpServer.Tests
 
             ScanAbsolute(check);
             CheckCallPins(check);
+            CheckReferenceSources(check);
             CheckGraph(check);
             CheckSafetyAndCounts(check);
             CheckFixedExclusions(check);
@@ -143,6 +144,7 @@ namespace TiaMcpServer.Tests
             foreach (var pin in symbolic.Pins.Concat(absolute.Pins).Where(p => p.Direction is "Input" or "InOut"))
             {
                 var use = Ref("FB", 81, "LAD", pin.Direction == "InOut" ? "RW" : "Read");
+                use.Origin = "simaticML";
                 use.CallPins.Add(pin);
                 var point = Point("Tag", "%I0.0", use, Ref("FB", 81, "LAD", "Read"));
                 var row = Row(Report(AuditRules(pin.BlockType, pin.BlockNumber, pin.BlockName, caller: true), point), "Tag");
@@ -185,11 +187,13 @@ namespace TiaMcpServer.Tests
             foreach (var pin in absolute.Pins.Where(p => p.Direction is not ("Input" or "InOut")))
             {
                 var use = Ref("FB", 81, "LAD", "Read");
+                use.Origin = "simaticML";
                 use.CallPins.Add(pin);
                 var row = Row(Report(AuditRules("FC", 7, "Peer"), Point("Tag", "%I0.1", use)), "Tag");
                 check(Status(row) == (pin.Direction == null ? "INCOMPLETE" : "FAIL"), "I audit: Output, Return and unknown directions");
             }
             var fb = Ref("FB", 81, "LAD", "Read");
+            fb.Origin = "simaticML";
             fb.CallPins.Add(symbolic.Pins[0]);
             var tag = Point("Tag", "%I0.0", fb);
             foreach (var audit in new[] { AuditRules("FC", 82, "Target"), AuditRules("FB", 83, "Target"), AuditRules("FB", 82, "Other") })
@@ -416,6 +420,7 @@ namespace TiaMcpServer.Tests
             PlcInputAuditReference Reference(PlcInputXmlUse use)
             {
                 var reference = Ref("FB", 81, "STL", use.Access);
+                reference.Origin = "simaticML";
                 reference.Location = use.Site;
                 reference.CallPins.AddRange(use.Pins);
                 return reference;
@@ -495,6 +500,42 @@ namespace TiaMcpServer.Tests
             issues.Clear();
             PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit("<Graph/>") + "</Document>"), issues);
             check(issues.Count > 0, "I audit: unsupported network must surface a warning");
+        }
+
+        private static void CheckReferenceSources(Action<bool, string> check)
+        {
+            var native = Ref("FB", 81, "LAD", "ReadAndSymbol");
+            native.BlockName = "Caller";
+            native.Network = 23;
+            native.CallPins.Add(new PlcInputCallPin { BlockType = "FC", BlockNumber = 7, BlockName = "Other", Pin = "ignored", Direction = "Output" });
+            var otherNetwork = Ref("FB", 81, "LAD", "Read");
+            otherNetwork.Network = 36;
+            var differentSymbol = Ref("FB", 81, "LAD", "Read");
+            differentSymbol.Network = 23;
+            differentSymbol.Symbol = "Tag.Member";
+            PlcInputAuditReference ParsedPin(string site, string pin)
+            {
+                var use = Ref("FB", 81, "LAD", "Read");
+                use.Origin = "simaticML";
+                use.Network = 23;
+                use.Location = site;
+                use.SymbolComponents = new[] { "Tag" };
+                use.CallPins.Add(new PlcInputCallPin { BlockType = "FB", BlockNumber = 82, BlockName = "Target", Pin = pin, Direction = "Input" });
+                return use;
+            }
+
+            var audit = AuditRules("FB", 82, "Target", caller: true);
+            var first = ParsedPin("NW23/1", "input1");
+            var row = Row(Report(audit, Point("Tag", "%I0.0", native, first)), "Tag");
+            var reference = row["references"]!.AsArray().Single()!;
+            check(Status(row) == "PASS" && reference["callerOrigin"]!.ToString() == "crossReference"
+                && reference["blockName"]!.ToString() == "Caller" && reference["origin"]!.ToString() == "simaticML"
+                && row["callPinConnections"]!.AsArray().Single()!["pin"]!.ToString() == "input1",
+                "I audit: summarize one symbolic usage with a native caller and an XML pin");
+
+            row = Row(Report(audit, Point("Tag", "%I0.0", native, first, ParsedPin("NW23/2", "input2"), otherNetwork, differentSymbol)), "Tag");
+            check(row["references"]!.AsArray().Count == 4 && row["callPinConnections"]!.AsArray().Count == 2,
+                "I audit: preserve distinct XML pins, networks and symbols");
         }
 
         private static string Unit(string body)
