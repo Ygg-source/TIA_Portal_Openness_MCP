@@ -5,6 +5,7 @@ using Siemens.Engineering.Safety;
 using Siemens.Engineering.SW;
 using Siemens.Engineering.SW.Blocks;
 using Siemens.Engineering.SW.Tags;
+using Siemens.Engineering.SW.TechnologicalObjects;
 using Siemens.Engineering.SW.Units;
 using System;
 using System.Collections.Generic;
@@ -61,30 +62,45 @@ namespace TiaMcpServer.Siemens
                 warnings.Add("Software unit enumeration failed: " + unitFailure);
             }
 
-            void CollectBlock(PlcBlock block, string group, string actualGroup, string? unit, bool safetyUnit)
+            void CollectBlock(PlcBlock block, string group, string actualGroup, string? unit, bool safetyUnit, bool systemBlock = false)
             {
                 if (blocks.ContainsKey(block)) return;
-                var metadata = new InputAuditBlock { Path = group, Unit = unit };
+                var metadata = new InputAuditBlock
+                {
+                    Path = group, Unit = unit, Type = block.GetType().Name,
+                    Kind = block is TechnologicalInstanceDB ? PlcInputProgramKind.TechnologyObject
+                        : PlcInputUsageAudit.ClassifyProgram(null, safetyUnit, systemBlock: systemBlock),
+                };
                 blocks.Add(block, metadata);
                 try
                 {
-                    var language = safetyUnit ? null : block.ProgrammingLanguage.ToString();
-                    metadata.Kind = PlcInputUsageAudit.ClassifyProgram(language, safetyUnit);
+                    string? language = null;
+                    if (metadata.Kind == PlcInputProgramKind.Unknown)
+                    {
+                        language = block.ProgrammingLanguage.ToString();
+                        metadata.Kind = PlcInputUsageAudit.ClassifyProgram(language, false, metadata.Type);
+                    }
                     metadata.Name = block.Name;
                     metadata.Path += "/" + metadata.Name;
                     blockPaths.Add((metadata.Path, block));
                     if (!string.Equals(group, actualGroup, StringComparison.OrdinalIgnoreCase))
                         blockPaths.Add(($"{actualGroup}/{metadata.Name}", block));
-                    metadata.Type = block.GetType().Name;
-                    if (metadata.Kind == PlcInputProgramKind.Safety) return;
-                    metadata.Language = language!;
+                    if (metadata.Kind is PlcInputProgramKind.Safety or PlcInputProgramKind.TechnologyObject) return;
+                    if (metadata.Kind is not (PlcInputProgramKind.System or PlcInputProgramKind.ProDiag))
+                        metadata.Kind = PlcInputUsageAudit.ClassifyProgram(language, false,
+                            metadata.Type, knowHowProtected: block.IsKnowHowProtected);
                     metadata.Number = block.Number;
                     metadata.Namespace = block.Namespace ?? "";
-                    if (block is InstanceDB instance) metadata.InstanceOf = instance.InstanceOfName;
+                    if (metadata.Kind == PlcInputProgramKind.Standard)
+                    {
+                        metadata.Language = language!;
+                        if (block is InstanceDB instance) metadata.InstanceOf = instance.InstanceOfName;
+                    }
                 }
                 catch (Exception ex) when (!PortalFailureClassifier.IsPortalProcessLost(ex))
                 {
-                    if (metadata.Kind == PlcInputProgramKind.Safety) return;
+                    if (metadata.Kind is PlcInputProgramKind.Safety or PlcInputProgramKind.System or PlcInputProgramKind.ProDiag
+                        or PlcInputProgramKind.Protected or PlcInputProgramKind.TechnologyObject) return;
                     metadata.Kind = PlcInputProgramKind.Unknown;
                     warnings.Add($"{metadata.Path}: block identity could not be read: {ex.Message}");
                 }
@@ -95,19 +111,19 @@ namespace TiaMcpServer.Siemens
                 }
             }
 
-            void CollectSystem(PlcSystemBlockGroup group, string path, string nativePath, string? unit, bool safetyUnit)
+            void CollectSystem(PlcSystemBlockGroup group, string path, string nativePath, string? unit)
             {
-                foreach (var block in group.Blocks) CollectBlock(block, path, nativePath, unit, safetyUnit);
+                foreach (var block in group.Blocks) CollectBlock(block, path, nativePath, unit, false, systemBlock: true);
                 foreach (var child in group.Groups)
-                    CollectSystem(child, $"{path}/{child.Name}", $"{nativePath}/{child.Name}", unit, safetyUnit);
+                    CollectSystem(child, $"{path}/{child.Name}", $"{nativePath}/{child.Name}", unit);
             }
 
             void CollectBlocks(PlcBlockSystemGroup blockGroup, string path, string? unit, bool safetyUnit)
             {
+                foreach (var group in blockGroup.SystemBlockGroups)
+                    CollectSystem(group, $"{path}/{group.Name}", $"{blockGroup.Name}/{group.Name}", unit);
                 foreach (var (group, block) in EnumerateUnitBlocks(blockGroup, path))
                     CollectBlock(block, group, blockGroup.Name + group.Substring(path.Length), unit, safetyUnit);
-                foreach (var group in blockGroup.SystemBlockGroups)
-                    CollectSystem(group, $"{path}/{group.Name}", $"{blockGroup.Name}/{group.Name}", unit, safetyUnit);
             }
 
             void CollectScope(string prefix, PlcTagTableGroup? tagGroup, PlcBlockSystemGroup? blockGroup, string? unit = null)
@@ -232,8 +248,9 @@ namespace TiaMcpServer.Siemens
             int xmlExportAttempts = 0, safetyXmlExportAttempts = 0, skippedInterfaceExportAttempts = 0;
             var unreadableBlocks = new JsonArray();
             var incompleteBlocks = new JsonArray();
-            var codeTargets = blocks.Values.Where(b => b.Kind == PlcInputProgramKind.Standard && b.Type is "FB" or "FC")
+            var codeTargets = blocks.Values.Where(b => b.Kind != PlcInputProgramKind.Unknown && b.Type is "FB" or "FC")
                 .ToLookup(b => b.Name, StringComparer.OrdinalIgnoreCase);
+            var numberedTargets = codeTargets.SelectMany(g => g).Where(b => b.Number > 0).ToLookup(b => b.Number);
             var qualifiedTargets = codeTargets.SelectMany(g => g).Where(b => b.Namespace.Length != 0)
                 .ToLookup(b => b.Namespace + "." + b.Name, StringComparer.OrdinalIgnoreCase);
             var instanceTargets = blocks.Values.Where(b => b.Kind == PlcInputProgramKind.Standard && b.Type == "InstanceDB")
@@ -241,6 +258,7 @@ namespace TiaMcpServer.Siemens
             var nativeUses = points.SelectMany(point => point.References.Select(r => (Point: point, Reference: r)))
                 .Where(x => x.Reference.ConfirmedUsage && !x.Reference.Absolute)
                 .ToLookup(x => (x.Reference.BlockPath, x.Point.Name!.ToUpperInvariant()));
+            var nativeByBlock = points.SelectMany(point => point.References).ToLookup(r => r.BlockPath);
             var untagged = new Dictionary<PlcInputSpan, PlcInputAuditPoint>();
             var callReferences = new List<(PlcInputAuditReference Reference, bool ResolveAccess)>();
             var temp = Path.Combine(Path.GetTempPath(), "tia-input-audit-" + Guid.NewGuid().ToString("N"));
@@ -255,7 +273,6 @@ namespace TiaMcpServer.Siemens
                     return metadata.PinDirections;
                 try
                 {
-                    if (block.IsKnowHowProtected) return null;
                     skippedInterfaceExportAttempts++;
                     block.Export(file, ExportOptions.None);
                     using var xml = XmlReader.Create(file.FullName);
@@ -285,15 +302,19 @@ namespace TiaMcpServer.Siemens
                     var graph = metadata.Language == "GRAPH";
                     try
                     {
-                        if (block.IsKnowHowProtected)
-                            throw new InvalidOperationException("the block body is know-how protected");
                         xmlExportAttempts++;
                         if (metadata.Kind == PlcInputProgramKind.Safety) safetyXmlExportAttempts++;
                         block.Export(file, ExportOptions.None);
                         var issues = new List<string>();
                         var graphIssues = new List<string>();
                         var xml = XDocument.Load(file.FullName);
-                        var matches = PlcInputSimaticMl.Scan(xml, issues, graphIssues, graph);
+                        var stlNetworks = new HashSet<int>();
+                        var matches = PlcInputSimaticMl.Scan(xml, issues, graphIssues, graph,
+                            expectStl: metadata.Language == "STL", stlNetworks: stlNetworks);
+                        if (stlNetworks.Count != 0)
+                            foreach (var native in nativeByBlock[path])
+                                if (native.Network is int network && stlNetworks.Contains(network))
+                                    native.Language = "STL";
                         if (metadata.Type is "FB" or "FC") metadata.PinDirections = PlcInputSimaticMl.ReadPinDirections(xml);
                         xmlScanned++;
                         if (graph) graphScanned++;
@@ -362,7 +383,8 @@ namespace TiaMcpServer.Siemens
                             var reference = new PlcInputAuditReference
                             {
                                 BlockPath = path, BlockType = metadata.Type, BlockNumber = metadata.Number, BlockName = metadata.Name,
-                                Language = metadata.Language, Access = access, Location = match.Site, Network = match.Network,
+                                Language = stlNetworks.Contains(match.Network) ? "STL" : metadata.Language,
+                                Access = access, Location = match.Site, Network = match.Network,
                                 AccessComplete = match.AccessComplete || match.Access == "Unknown" && access != "Unknown",
                                 HasOtherWrite = match.HasOtherWrite, NetworkScanComplete = match.NetworkScanComplete,
                                 Address = match.Absolute ? match.Span.Canonical : null,
@@ -396,10 +418,13 @@ namespace TiaMcpServer.Siemens
                 }
                 foreach (var (reference, resolveAccess) in callReferences)
                 {
-                    foreach (var pin in reference.CallPins)
-                        ResolveInputCallPin(pin, codeTargets, qualifiedTargets, instanceTargets, ReadSkippedInterface);
+                    reference.CallPins.RemoveAll(pin => !ResolveInputCallPin(pin, codeTargets, qualifiedTargets,
+                        numberedTargets, instanceTargets, ReadSkippedInterface));
                     if (resolveAccess && reference.CallPins.Count == 1 && reference.CallPins[0].Confirmed)
+                    {
                         reference.Access = PlcInputSimaticMl.SectionAccess(reference.CallPins[0].Direction);
+                        reference.AccessComplete = true;
+                    }
                 }
             }
             finally
@@ -443,7 +468,8 @@ namespace TiaMcpServer.Siemens
             void ClassifyMember(string? name, string type)
             {
                 if (string.IsNullOrWhiteSpace(name)) return;
-                var candidates = blocks.Where(b => (b.Type == type || type == "DB" && b.Type is "GlobalDB" or "InstanceDB")
+                var candidates = blocks.Where(b => b.Kind is not (PlcInputProgramKind.System or PlcInputProgramKind.ProDiag)
+                    && (b.Type == type || type == "DB" && b.Type is "GlobalDB" or "InstanceDB")
                     && string.Equals(b.Name, name, StringComparison.OrdinalIgnoreCase)).ToList();
                 if (candidates.Count == 1)
                     candidates[0].Kind = PlcInputProgramKind.Safety;
@@ -497,19 +523,22 @@ namespace TiaMcpServer.Siemens
 
         private static string RootSymbol(string[] components) => components[0];
 
-        private static void ResolveInputCallPin(PlcInputCallPin pin, ILookup<string, InputAuditBlock> targets,
-            ILookup<string, InputAuditBlock> qualifiedTargets, ILookup<string, InputAuditBlock> instances,
+        private static bool ResolveInputCallPin(PlcInputCallPin pin, ILookup<string, InputAuditBlock> targets,
+            ILookup<string, InputAuditBlock> qualifiedTargets, ILookup<int, InputAuditBlock> numberedTargets,
+            ILookup<string, InputAuditBlock> instances,
             Func<InputAuditBlock, ILookup<string, string>?> readSkippedInterface)
         {
-            if (pin.BlockType is not ("FB" or "FC")) return;
+            if (pin.BlockType is not ("FB" or "FC")) return true;
             var name = pin.BlockName?.Replace("\"", "") ?? "";
             if (pin.BlockType == "FB" && name.Length == 0 && pin.InstanceTypeName != null)
                 name = pin.InstanceTypeName.Replace("\"", "");
             var candidates = targets[name].Concat(qualifiedTargets[name]).Where(b => b.Type == pin.BlockType).Distinct().ToList();
+            if (name.Length == 0 && pin.BlockNumber is int number)
+                candidates = numberedTargets[number].Where(b => b.Type == pin.BlockType).ToList();
             if (pin.BlockType == "FB" && pin.InstanceScope == "GlobalVariable" && !string.IsNullOrWhiteSpace(pin.InstanceName))
             {
                 var instance = instances[pin.InstanceName!].ToList();
-                if (instance.Count > 1) return;
+                if (instance.Count > 1) { pin.BlockNumber = null; return true; }
                 if (instance.Count == 1)
                 {
                     var instanceType = instance[0].InstanceOf?.Replace("\"", "") ?? "";
@@ -522,15 +551,20 @@ namespace TiaMcpServer.Siemens
                             || string.Equals(instanceType, b.Namespace + "." + b.Name, StringComparison.OrdinalIgnoreCase)).ToList();
                 }
             }
-            if (candidates.Count != 1) return;
+            if (candidates.Count > 1 && pin.BlockNumber is int calledNumber)
+                candidates = candidates.Where(b => b.Number == calledNumber).ToList();
+            if (candidates.Count != 1) { pin.BlockNumber = null; return true; }
+            if (candidates[0].Kind is PlcInputProgramKind.System or PlcInputProgramKind.ProDiag or PlcInputProgramKind.Safety)
+                return false;
             pin.BlockName = candidates[0].Name;
-            pin.BlockNumber = candidates[0].Number;
-            if (pin.Direction == null && pin.Pin != null
+            if (candidates[0].Number > 0) pin.BlockNumber = candidates[0].Number;
+            if (candidates[0].Kind == PlcInputProgramKind.Standard && pin.Direction == null && pin.Pin != null
                 && (candidates[0].PinDirections ?? readSkippedInterface(candidates[0])) is { } directions)
             {
                 var sections = directions[pin.Pin].ToList();
                 if (sections.Count == 1) pin.Direction = sections[0];
             }
+            return true;
         }
 
         private static void ReadNativeInputReferences(PlcTag tag, PlcInputAuditPoint point, string plcName,
@@ -558,34 +592,34 @@ namespace TiaMcpServer.Siemens
                     var sourcePath = referencePath.Length == 0 ? entry.ReferenceName : $"{referencePath}/{entry.ReferenceName}";
                     var usage = new PlcInputAuditReference
                     {
-                        BlockPath = sourcePath, Access = entry.Access, Location = entry.ReferenceLocation,
-                        Detail = entry.SourceHierarchy + (string.IsNullOrWhiteSpace(entry.LocationName) ? "" : " / " + entry.LocationName),
+                        BlockPath = sourcePath, Location = entry.ReferenceLocation,
                         ConfirmedUsage = entry.ReferenceType == "UsedBy",
                     };
-                    if (entry.ReferenceLocation != null
-                        && int.TryParse(InputReferenceNetwork.Match(entry.ReferenceLocation).Groups[1].Value, out var network))
-                        usage.Network = network;
-                    var referredAs = location?.ReferencedAsName?.Trim();
-                    usage.Symbol = referredAs;
-                    if (referredAs != null && referredAs.StartsWith("%I", StringComparison.OrdinalIgnoreCase)
-                        && PlcInputSpan.TryParse(referredAs, out var direct))
-                    {
-                        usage.Address = direct.Canonical;
-                        usage.Absolute = true;
-                        usage.Symbol = null;
-                    }
 
-                    object? user = null;
+                    PlcBlock? userBlock = null;
                     try
                     {
-                        user = reference.UnderlyingObject;
+                        // V20 represents technological objects as TechnologicalInstanceDBs.
+                        for (var user = reference.UnderlyingObject as IEngineeringObject; user != null; user = user.Parent)
+                        {
+                            if (user is TechnologicalInstanceDB or TechnologicalParameter or TechnologicalInstanceDBGroup)
+                            {
+                                PlcInputUsageAudit.AddNativeProgramUse(point, usage, PlcInputProgramKind.TechnologyObject, false);
+                                return;
+                            }
+                            if (user is PlcSystemBlockGroup) return;
+                            if (user is PlcBlock candidate)
+                            {
+                                userBlock = candidate;
+                                if (blocks.ContainsKey(candidate)) break;
+                            }
+                        }
                     }
                     catch (Exception ex) when (!PortalFailureClassifier.IsPortalProcessLost(ex))
                     {
                         // Some members have no accessible object. A fully qualified, unique path can
                         // still identify a block from the existing Openness inventory.
                     }
-                    var userBlock = user as PlcBlock;
                     var prefix = plcName + "/";
                     if (userBlock == null && sourcePath != null && sourcePath.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
                     {
@@ -593,24 +627,34 @@ namespace TiaMcpServer.Siemens
                         var matches = byPath[qualifiedPath].Distinct().ToList();
                         if (matches.Count == 1) userBlock = matches[0];
                     }
-                    if (userBlock == null || !blocks.TryGetValue(userBlock, out var block) || block.Kind == PlcInputProgramKind.Unknown)
+                    if (userBlock == null || !blocks.TryGetValue(userBlock, out var block))
                     {
-                        point.ReferencesComplete = false;
-                        point.ReferenceIssues.Add($"Could not confirm the block identity at {sourcePath} {entry.ReferenceLocation}.");
+                        PlcInputUsageAudit.AddNativeProgramUse(point, usage, PlcInputProgramKind.Unknown, false);
                         return;
                     }
-                    if (block.Kind == PlcInputProgramKind.Safety)
+                    if (block.Kind == PlcInputProgramKind.Standard && !block.Skipped)
                     {
-                        point.HasSafetyUse |= usage.ConfirmedUsage;
-                        return;
+                        usage.BlockPath = block.Path;
+                        usage.BlockName = block.Name;
+                        usage.BlockType = block.Type;
+                        usage.BlockNumber = block.Number;
+                        usage.Language = block.Language;
+                        usage.Access = entry.Access;
+                        usage.Detail = entry.SourceHierarchy + (string.IsNullOrWhiteSpace(entry.LocationName) ? "" : " / " + entry.LocationName);
+                        if (entry.ReferenceLocation != null
+                            && int.TryParse(InputReferenceNetwork.Match(entry.ReferenceLocation).Groups[1].Value, out var network))
+                            usage.Network = network;
+                        var referredAs = location?.ReferencedAsName?.Trim();
+                        usage.Symbol = referredAs;
+                        if (referredAs != null && referredAs.StartsWith("%I", StringComparison.OrdinalIgnoreCase)
+                            && PlcInputSpan.TryParse(referredAs, out var direct))
+                        {
+                            usage.Address = direct.Canonical;
+                            usage.Absolute = true;
+                            usage.Symbol = null;
+                        }
                     }
-                    if (block.Skipped) return;
-                    usage.BlockPath = block.Path;
-                    usage.BlockName = block.Name;
-                    usage.BlockType = block.Type;
-                    usage.BlockNumber = block.Number;
-                    usage.Language = block.Language;
-                    point.References.Add(usage);
+                    PlcInputUsageAudit.AddNativeProgramUse(point, usage, block.Kind, block.Skipped);
                 });
             if (truncation != null) throw new InvalidOperationException(truncation);
         }

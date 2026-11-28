@@ -25,17 +25,27 @@
 
 ## 检查规则
 
-- 调用者访问规则由 `fbRuleEnabled` 控制，默认要求所有参与审计的普通程序引用出现在 LAD FB81。`Read`、`ReadAndSymbol` 以及可归因到已确认 `InOut` 直连的读写访问满足要求。如果原生写入可能来自该连接但无法核实归属，报告会注明无法确认。其他写入继续判违规，未知访问类型影响完整性。
+- 调用者访问规则由 `fbRuleEnabled` 控制，默认要求所有参与审计的普通程序引用出现在 LAD FB81。同一块中的 STL 网络按 STL 判断。`Read`、`ReadAndSymbol` 以及可归因到已确认 `InOut` 直连的读写访问满足访问要求。如果原生写入可能来自该连接但无法核实归属，报告会注明无法确认。其他写入继续判违规，未知访问类型影响完整性。
 - FB/FC 引脚规则由 `callPinRuleEnabled` 控制，默认关闭。启用时必须提供 `requiredCallBlockType`（`FB` 或 `FC`）、正整数 `requiredCallBlockNumber` 和非空 `requiredCallBlockName`。完整检查要求每点至少有一个目标块的 `Input` 或 `InOut` 直连。其他 FB/FC 的引脚以及 `Output`、`Return` 均判为违规。Contact 等普通读取位置仍适用调用者规则。
 - GRAPH 直接使用规则由 `graphTransitionRuleEnabled` 控制，默认关闭。该字段覆盖转换条件、前固定指令和后固定指令。直接使用 I 点符号或绝对地址的操作数及调用实参均判为违规。步骤动作、联锁、监控仍适用已启用的调用者及引脚规则。
 
 工具通过 `PlcTag.CrossReferenceService` 读取原生引用，并从标准代码块的 SimaticML 提取位置、操作数、调用及引脚信息。符号根据全局作用域、变量表身份和原生引用核对。FB 类型从 `CallInfo` 及块清单识别，通过实例 DB 的类型归属核对单实例，并用调用者接口的声明区分多重实例和参数实例。SCL 中 `=>` 确认输出连接，缺少方向时可由已识别的被调用块接口确认。SCL 复合表达式中的操作数记录为程序引用，只有作为独立实参使用时才计入引脚直连。声明、定义及地址重叠关系等元数据不计作程序使用。原生交叉引用的定位粒度由 TIA 决定，XML 保留同一网络内各可区分用法。不可读的普通块、无法识别的连接和不受支持的格式会显式降低覆盖完整性。
 
-固定排除规则在导出和引用筛选前读取 Openness 的 F 编程语言枚举、安全软件单元归属及 `SafetyAdministration.RuntimeGroups`。运行组成员包括 F-OB、主安全块、主安全实例 DB 和运行组信息 DB。程序资源和编译器块等系统块组也纳入身份枚举。已确认的安全块跳过且不影响完整性。无法确认身份的块跳过并记录覆盖不足。CPU 型号和订货号仅用于显示。审计在系统临时目录处理普通块 XML，不编译或保存工程。直接枚举 PLC 根目录和普通软件单元的变量表，不受 `GetPlcTags` 5000 条返回上限影响。
+审计在导出前排除已确认的 Know-how protected 块、ProDiag FB、ProDiag OB、系统块组中的块和安全程序。保护状态读取失败会降低覆盖完整性并阻止导出。ProDiag 由 V20 的 `ProDiag` / `ProDiag_OB` 语言枚举及 FB / OB 对象类型共同识别。`S7_PDIAG` 继续按普通程序处理。系统块组只用于身份筛选。安全分类沿用 F 编程语言枚举、安全软件单元归属和 `SafetyAdministration.RuntimeGroups`。运行组成员包括 F-OB、主安全块、主安全实例 DB 和运行组信息 DB。F-CPU 上的普通块仍参与检查。
+
+原生交叉引用中的工艺对象通过 V20 的 `UnderlyingObject` 和对象父级识别，包括 `TechnologicalInstanceDB`、工艺参数及工艺对象组。工艺对象引用从明细中排除，混合引用保留普通程序的位置。仅有工艺对象引用的输入不构成普通程序用法。其他无法识别的引用仍计入覆盖不足。审计在系统临时目录处理普通块 XML，工程操作限于读取。变量表枚举覆盖 PLC 根目录和普通软件单元。
+
+## STL 解析
+
+V20 的 STL 网络通过 `SW.Blocks.CompileUnit/AttributeList/NetworkSource` 下的 `StatementList` 读取。PA40080 的 LAD 块里实际导出了 `StatementList/v5` 网络，网络的 `ProgrammingLanguage` 为 `STL`，每条指令对应一个 `StlStatement`，助记符位于 `StlToken/@Text`，行内注释位于 `LineComment`。SCL 继续使用 `StructuredText` 解析。
+
+STL 按指令和操作数位置区分读取、写入和读写。例如 `A`、`AN`、`O`、`ON` 和 `L` 读取，`Assign`（`=`）、`S`、`R` 和 `T` 写入，边沿指令读写其边沿存储位。`SET` 将 RLO 置 1，`SAVE` 将 RLO 保存到 BR，两条指令都没有 I 点操作数。地址和全局符号来自结构化操作数，注释和字符串中的地址文本不产生引用。 [Siemens V20 SET](https://docs.tia.siemens.cloud/r/en-us/v20/stl-s7-1500/stl-mnemonic-s7-1500/bit-logic-operations-s7-1500/set-set-rlo-to-1-s7-1500)、[Siemens V20 SAVE](https://docs.tia.siemens.cloud/r/en-us/v20/stl-s7-1500/stl-mnemonic-s7-1500/bit-logic-operations-s7-1500/save-save-rlo-in-br-bit-s7-1500)
+
+STL 的 FB/FC 调用沿用 `callPinConnections`。从 `CallInfo` 获取目标、实例和实参，结合块清单及可读接口补充身份与方向。受保护的被调用块只使用调用处已有的引脚方向及块清单身份。间接寻址、动态索引、指针，以及无法识别的操作数、指令或网络结构会降低覆盖完整性。
 
 ## 结果
 
-可在用户 JSON 的 `scope.skipFbBlocks` 填写编号和名称的混合数组，例如 `[81, 120, "Feedback_Check"]`。读取脚本将它映射成 MCP 的 `skipFbNumbers` 和 `skipFbNames`。匹配编号或完整名称（忽略大小写）的普通 FB 将从调用者扫描和用法统计中排除。其他块调用这些 FB 且调用位置缺少引脚方向时，会按需导出接口元数据以确认该外部用法。
+可在用户 JSON 的 `scope.skipFbBlocks` 填写编号和名称的混合数组，例如 `[81, 120, "Feedback_Check"]`。读取脚本将它映射成 MCP 的 `skipFbNumbers` 和 `skipFbNames`。匹配编号或完整名称（忽略大小写）的普通 FB 将从调用者扫描和用法统计中排除。其他块调用这些可读 FB 且调用位置缺少引脚方向时，会按需导出接口元数据以确认该外部用法。
 
 全量响应超过 MCP 会话阈值时，返回 `exportId`。在同一会话用 `GetExport` 从偏移量 0 开始获取所有字符切片，按 `nextOffset` 读到 `eof=true`，拼接后再解析 JSON。审计只执行一次。
 

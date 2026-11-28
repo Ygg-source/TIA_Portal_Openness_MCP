@@ -28,7 +28,7 @@ namespace TiaMcpServer.Siemens
     internal static class PlcInputSimaticMl
     {
         internal static List<PlcInputXmlUse> Scan(XDocument xml, IList<string> issues, IList<string>? graphIssues = null,
-            bool expectGraph = false)
+            bool expectGraph = false, bool expectStl = false, ISet<int>? stlNetworks = null)
         {
             graphIssues ??= issues;
             var operands = new List<PlcInputXmlUse>();
@@ -40,7 +40,11 @@ namespace TiaMcpServer.Siemens
             for (int i = 0; i < units.Count; i++)
             {
                 int network = i + 1;
-                var source = Child(Child(units[i], "AttributeList"), "NetworkSource");
+                var attributes = Child(units[i], "AttributeList");
+                var source = Child(attributes, "NetworkSource");
+                var stl = (Child(attributes, "ProgrammingLanguage")?.Value ?? (expectStl ? "STL" : null)) == "STL"
+                    || source?.Elements().Any(PlcInputStatementList.IsStatementList) == true;
+                if (stl) stlNetworks?.Add(network);
                 if (source == null)
                 {
                     issues.Add($"NW{network}: missing NetworkSource");
@@ -48,9 +52,16 @@ namespace TiaMcpServer.Siemens
                 }
                 var content = source.Elements().ToList();
                 int firstOperand = operands.Count, ordinaryIssueCount = issues.Count, graphIssueCount = graphIssues.Count;
-                if (content.Count == 0 && !string.IsNullOrWhiteSpace(source.Value))
+                if (stl)
+                {
+                    if (content.Count != 1 || !PlcInputStatementList.IsStatementList(content[0]))
+                        issues.Add($"NW{network}: unsupported or missing STL NetworkSource");
+                    else
+                        PlcInputStatementList.Scan(content[0], network, operands, issues);
+                }
+                else if (content.Count == 0 && !string.IsNullOrWhiteSpace(source.Value))
                     issues.Add($"NW{network}: unstructured NetworkSource");
-                foreach (var body in content)
+                foreach (var body in stl ? Enumerable.Empty<XElement>() : content)
                 {
                     if (Is(body, "Graph"))
                     {
@@ -209,17 +220,17 @@ namespace TiaMcpServer.Siemens
             }
         }
 
-        private static string[] Components(XElement e) => e.Elements().Where(c => Is(c, "Component"))
+        internal static string[] Components(XElement e) => e.Elements().Where(c => Is(c, "Component"))
             .Select(c => (string?)c.Attribute("Name") ?? "").Where(n => n.Length != 0).ToArray();
 
         private static bool Is(XElement e, string name) => e.Name.LocalName == name;
-        private static XElement? Child(XElement? e, string name) => e?.Elements().FirstOrDefault(child => Is(child, name));
+        internal static XElement? Child(XElement? e, string name) => e?.Elements().FirstOrDefault(child => Is(child, name));
         private static bool LooksLikeAddressToken(string? token) => token != null
             && token.StartsWith("%I", StringComparison.OrdinalIgnoreCase);
-        private static string WithoutPeriphery(string token) => token.EndsWith(":P", StringComparison.OrdinalIgnoreCase)
+        internal static string WithoutPeriphery(string token) => token.EndsWith(":P", StringComparison.OrdinalIgnoreCase)
             ? token.Substring(0, token.Length - 2) : token;
 
-        private static bool TryAddress(XElement node, out PlcInputSpan span)
+        internal static bool TryAddress(XElement node, out PlcInputSpan span)
         {
             span = default;
             if (!int.TryParse((string?)node.Attribute("BitOffset"), NumberStyles.None, CultureInfo.InvariantCulture, out var offset))
@@ -280,7 +291,7 @@ namespace TiaMcpServer.Siemens
             return directions.Single();
         }
 
-        private static PlcInputCallPin CallPin(XElement? call, string? pin, string? section, string? callUid)
+        internal static PlcInputCallPin CallPin(XElement? call, string? pin, string? section, string? callUid)
         {
             var instance = Child(call, "Instance");
             var scope = (string?)instance?.Attribute("Scope");

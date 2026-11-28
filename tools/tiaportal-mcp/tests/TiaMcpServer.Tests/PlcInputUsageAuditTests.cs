@@ -79,6 +79,8 @@ namespace TiaMcpServer.Tests
             CheckCallPins(check);
             CheckGraph(check);
             CheckSafetyAndCounts(check);
+            CheckFixedExclusions(check);
+            CheckStatementList(check);
             check(ToolSafety.Classify("AuditPlcInputUsage").ReadOnly, "I audit: read-only policy");
         }
 
@@ -319,6 +321,120 @@ namespace TiaMcpServer.Tests
             check(skipAudit.SkipBlock("FB", 81, "Different") && skipAudit.SkipBlock("FB", 900, "named fb")
                 && skipAudit.SkipBlock("FB", 901, "AnotherFB") && !skipAudit.SkipBlock("FC", 81, "Named FB")
                 && !skipAudit.SkipBlock("FB", 901, "Other"), "I audit: skip assigned FB numbers or exact names only");
+        }
+
+        private static void CheckFixedExclusions(Action<bool, string> check)
+        {
+            var protectedBlock = PlcInputUsageAudit.ClassifyProgram("LAD", false, "FB", knowHowProtected: true);
+            var failedProtection = PlcInputUsageAudit.ClassifyProgram("LAD", false, "FB", knowHowProtected: null);
+            var proDiagFb = PlcInputUsageAudit.ClassifyProgram("ProDiag", false, "FB");
+            var proDiagOb = PlcInputUsageAudit.ClassifyProgram("ProDiag_OB", false, "OB");
+            var system = PlcInputUsageAudit.ClassifyProgram("LAD", false, "FB", systemBlock: true);
+            var safety = PlcInputUsageAudit.ClassifyProgram("F_LAD", false, "FB");
+            check(protectedBlock == PlcInputProgramKind.Protected && failedProtection == PlcInputProgramKind.Unknown
+                && !PlcInputUsageAudit.CanExport(protectedBlock, true) && !PlcInputUsageAudit.CanExport(failedProtection, true),
+                "I audit: know-how protected blocks and failed protection reads are excluded before export");
+            check(proDiagFb == PlcInputProgramKind.ProDiag && proDiagOb == PlcInputProgramKind.ProDiag
+                && !PlcInputUsageAudit.CanExport(proDiagFb, true) && !PlcInputUsageAudit.CanExport(proDiagOb, true)
+                && PlcInputUsageAudit.ClassifyProgram("ProDiag", false, "OB") == PlcInputProgramKind.Unknown
+                && new[] { ("LAD", "FB"), ("SCL", "OB"), ("S7_PDIAG", "FB") }.All(b =>
+                    PlcInputUsageAudit.CanExport(PlcInputUsageAudit.ClassifyProgram(b.Item1, false, b.Item2), true)),
+                "I audit: exact V20 ProDiag language and FB/OB identity, keep ordinary blocks and S7_PDIAG");
+            check(system == PlcInputProgramKind.System && !PlcInputUsageAudit.CanExport(system, true)
+                && safety == PlcInputProgramKind.Safety && !PlcInputUsageAudit.CanExport(safety, true),
+                "I audit: system group membership and safety programs prevent export");
+
+            var filtered = Point("Filtered", "%I0.0");
+            var mixed = Point("Mixed", "%I0.1");
+            var unknown = Point("Unknown", "%I0.2");
+            var excludedUse = Ref("FB", 82, "SCL", "Write");
+            excludedUse.BlockPath = "Technology objects/Axis";
+            foreach (var kind in new[] { protectedBlock, proDiagFb, proDiagOb, system, PlcInputProgramKind.TechnologyObject })
+                PlcInputUsageAudit.AddNativeProgramUse(filtered, excludedUse, kind, false);
+            PlcInputUsageAudit.AddNativeProgramUse(mixed, excludedUse, PlcInputProgramKind.TechnologyObject, false);
+            PlcInputUsageAudit.AddNativeProgramUse(mixed, Ref("FB", 81, "LAD", "Read"), PlcInputProgramKind.Standard, false);
+            PlcInputUsageAudit.AddNativeProgramUse(unknown, excludedUse, PlcInputProgramKind.Unknown, false);
+            var report = Report(Audit(), filtered, mixed, unknown);
+            check(Status(Row(report, "Filtered")) == "UNUSED" && filtered.ReferencesComplete && filtered.ReferenceIssues.Count == 0
+                && Status(Row(report, "Mixed")) == "PASS" && mixed.References.Count == 1 && mixed.ReferencesComplete
+                && Status(Row(report, "Unknown")) == "INCOMPLETE" && unknown.ReferenceIssues.Count == 1
+                && report["checkedInputCount"]!.GetValue<int>() == 2,
+                "I audit: exclude technology object references without hiding unknown non-block references or ordinary uses");
+        }
+
+        private static void CheckStatementList(Action<bool, string> check)
+        {
+            const string address = """<Access Scope="Address"><Address Area="Input" Type="Bool" BitOffset="1"/></Access>""";
+            const string symbol = """<Access Scope="GlobalVariable"><Symbol><Component Name="Input.Tag"/></Symbol></Access>""";
+            string Instruction(string mnemonic, string operand = "") => $"""<StlStatement><StlToken Text="{mnemonic}"/>{operand}</StlStatement>""";
+            string Stl(string statements) => """<StatementList xmlns="http://www.siemens.com/automation/Openness/SW/NetworkSource/StatementList/v5">"""
+                + statements + "</StatementList>";
+            XDocument Document(params string[] networks) => XDocument.Parse("<Document>" + string.Concat(networks.Select(Unit)) + "</Document>");
+            var reads = new[] { "A", "AN", "O", "ON", "L", "X", "XN" };
+            var writes = new[] { "Assign", "=", "S", "R", "T" };
+            var noOperands = Instruction("SET", "<LineComment><Text>A %I100.0</Text></LineComment>") + Instruction("SAVE")
+                + Instruction("L", """<Access Scope="TypedConstant"><Constant><ConstantType>String</ConstantType><ConstantValue>'%I100.1'</ConstantValue></Constant></Access>""");
+            var issues = new List<string>();
+            var stlNetworks = new HashSet<int>();
+            var uses = PlcInputSimaticMl.Scan(Document("<FlgNet><Parts/></FlgNet>", Stl(noOperands +
+                string.Concat(reads.Select(m => Instruction(m, symbol)))), Stl(
+                string.Concat(writes.Select(m => Instruction(m, address))) + Instruction("Rise", address))), issues,
+                stlNetworks: stlNetworks);
+            check(issues.Count == 0 && stlNetworks.SetEquals(new[] { 2, 3 }) && uses.Count == reads.Length + writes.Length + 1
+                && uses.Take(reads.Length).All(u => u.Access == "Read" && u.Network == 2 && u.Confirmed
+                    && u.Symbol!.SequenceEqual(new[] { "Input.Tag" }))
+                && uses.Skip(reads.Length).Take(writes.Length).All(u => u.Access == "Write" && u.Network == 3
+                    && u.Confirmed && u.Absolute && u.Span.Canonical == "%I0.1")
+                && uses.Last().Access == "RW", "I audit: STL mnemonic access, global and absolute operands in mixed networks and no access for SET, SAVE, comments or strings");
+
+            string Parameter(string name, string section, string operand) => $"""<Parameter Name="{name}" Section="{section}">{operand}</Parameter>""";
+            string Call(string type, int number, string name, string parameters) => Instruction("CALL", $"""
+                <Access Scope="Call"><CallInfo Name="{name}" BlockType="{type}">
+                  <IntegerAttribute Name="BlockNumber" Informative="true">{number}</IntegerAttribute>
+                  {parameters}
+                </CallInfo></Access>
+                """);
+            var calls = PlcInputSimaticMl.Scan(Document(Stl(
+                Call("FB", 82, "Target", Parameter("in", "Input", symbol) + Parameter("io", "InOut", address))
+                + Call("FC", 7, "Peer", Parameter("out", "Output", address) + Parameter("ret", "Return", symbol)))), issues);
+            check(issues.Count == 0 && calls.Select(u => u.Access).SequenceEqual(new[] { "Read", "RW", "Write", "Write" })
+                && calls.Select(u => u.Pins.Single().Direction).SequenceEqual(new[] { "Input", "InOut", "Output", "Return" })
+                && calls.All(u => u.Pins.Single().Confirmed) && calls[0].Pins[0].BlockName == "Target"
+                && calls[0].Pins[0].BlockNumber == 82 && calls[0].Pins[0].BlockType == "FB" && calls[1].Pins[0].Pin == "io"
+                && calls[2].Pins[0].BlockName == "Peer" && calls[2].Pins[0].BlockNumber == 7 && calls[2].Pins[0].BlockType == "FC",
+                "I audit: STL FB/FC call targets and distinct parameter directions");
+            var numericCall = Instruction("CALL", $$"""
+                <Access Scope="Call"><CallInfo BlockType="FC">
+                    <Instance Scope="Address"><Address Area="FC" BlockNumber="7"/></Instance>
+                    {{Parameter("value", "Input", """<Token Text="%IW2"/>""")}}
+                </CallInfo></Access>
+                """);
+            var numeric = PlcInputSimaticMl.Scan(Document(Stl(numericCall)), issues).Single();
+            check(issues.Count == 0 && numeric.Span.Canonical == "%IW2" && numeric.Pins[0].BlockType == "FC"
+                && numeric.Pins[0].BlockNumber == 7 && numeric.Pins[0].BlockName == null,
+                "I audit: numeric STL call target and absolute operand token");
+            PlcInputAuditReference Reference(PlcInputXmlUse use)
+            {
+                var reference = Ref("FB", 81, "STL", use.Access);
+                reference.Location = use.Site;
+                reference.CallPins.AddRange(use.Pins);
+                return reference;
+            }
+            var passPins = AuditRules("FB", 82, "Target");
+            var failPins = AuditRules("FC", 7, "Peer");
+            check(Status(Row(Report(passPins, Point("Pins", "%I0.1", Reference(calls[0]), Reference(calls[1]))), "Pins")) == "PASS"
+                && Status(Row(Report(failPins, Point("Pins", "%I0.1", Reference(calls[2]), Reference(calls[3]))), "Pins")) == "FAIL",
+                "I audit: apply existing pin rules to STL Input/InOut and Output/Return");
+            var wrongCaller = Row(Report(Audit(), Point("InStl", "%I0.1", Reference(uses[0]))), "InStl");
+            check(Status(wrongCaller) == "FAIL" && wrongCaller["violations"]!.AsArray().Any(v => v!["code"]!.ToString() == "WRONG_CALLER"),
+                "I audit: STL use in FB81 violates the LAD caller requirement");
+
+            var partial = PlcInputSimaticMl.Scan(Document(Stl(
+                Instruction("A", """<Access Scope="Address"><Indirect><Access Scope="Address"><Address Area="Input" BitOffset="3" Type="Bool"/></Access></Indirect></Access>""")
+                + Instruction("L", """<Access Scope="TypedConstant"><Constant><ConstantType>Pointer</ConstantType><ConstantValue>P#I 0.0</ConstantValue></Constant></Access>""")
+                + Instruction("Mystery", address) + "<Unexpected/>"), "<StructuredText/>"), issues, expectStl: true);
+            check(issues.Count == 5 && partial.Count == 1 && partial[0].Access == "Unknown" && !partial[0].AccessComplete
+                && !partial[0].NetworkScanComplete, "I audit: incomplete STL indirect, pointer, unknown instruction and unsupported XML");
         }
 
         private static PlcInputUsageAudit AuditRules(string? type, int? number, string? name, bool pins = true,

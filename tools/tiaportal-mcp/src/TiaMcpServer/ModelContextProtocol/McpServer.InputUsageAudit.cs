@@ -9,7 +9,7 @@ namespace TiaMcpServer.ModelContextProtocol
 {
     public partial class McpServer
     {
-        [McpServerTool(Name = "AuditPlcInputUsage"), Description("[L1][PLC-Software][READ-ONLY] Audit standard PLC input uses, caller access, FB/FC pins and direct GRAPH use, including software units. Safety program blocks are excluded. Requires a PLC software path and inclusive input ranges.")]
+        [McpServerTool(Name = "AuditPlcInputUsage"), Description("[L1][PLC-Software][READ-ONLY] Audit standard PLC input uses, caller access, FB/FC pins and direct GRAPH use, including STL networks and software units. Excludes safety, know-how protected, ProDiag and system blocks and technology object references. Requires a PLC software path and inclusive input ranges.")]
         public static ResponseJsonReport AuditPlcInputUsage(
             [Description("PLC Software object path from GetProjectTree")] string softwarePath,
             [Description("Inclusive ranges, e.g. [\"%I0.0..%I1.7\", \"%IW8..%ID12\"]; a single address is allowed")] string[] addressRanges,

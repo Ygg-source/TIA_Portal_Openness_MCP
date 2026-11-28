@@ -84,5 +84,6 @@
     <Compile Include="..\..\src\TiaMcpServer\ModelContextProtocol\ClassicHmiScreenXmlBuilder.cs" Link="ClassicHmiScreenXmlBuilder.cs" />
     <Compile Include="..\..\src\TiaMcpServer\Siemens\PlcInputUsageAudit.cs" Link="PlcInputUsageAudit.cs" />
     <Compile Include="..\..\src\TiaMcpServer\Siemens\PlcInputSimaticMl.cs" Link="PlcInputSimaticMl.cs" />
+    <Compile Include="..\..\src\TiaMcpServer\Siemens\PlcInputStatementList.cs" Link="PlcInputStatementList.cs" />
   </ItemGroup>
 </Project>
