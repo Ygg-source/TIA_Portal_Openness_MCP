@@ -15,10 +15,12 @@ namespace TiaMcpServer.Siemens
         internal bool AccessComplete { get; set; } = true;
         internal bool HasOtherWrite { get; set; }
         internal bool NetworkScanComplete { get; set; } = true;
+        internal bool CallPinTraceComplete { get; set; } = true;
         internal int Network { get; set; }
         internal string Site { get; set; } = "";
         internal bool Confirmed { get; set; }
         internal string? GraphRegion { get; set; }
+        internal int? GraphOperationNumber { get; set; }
         internal int? GraphSequence { get; set; }
         internal string? TransitionName { get; set; }
         internal int? TransitionNumber { get; set; }
@@ -71,7 +73,8 @@ namespace TiaMcpServer.Siemens
                     }
                     if (!Is(body, "FlgNet") && !Is(body, "StructuredText"))
                         issues.Add($"NW{network}: unsupported network format {body.Name.LocalName}");
-                    ScanBody(body, network, $"NW{network}", operands, issues);
+                    ScanBody(body, network, $"NW{network}", operands, issues,
+                        traceContacts: Child(attributes, "ProgrammingLanguage")?.Value != "FBD");
                 }
                 if (issues.Count != ordinaryIssueCount || graphIssues.Count != graphIssueCount)
                     for (int operand = firstOperand; operand < operands.Count; operand++)
@@ -84,7 +87,8 @@ namespace TiaMcpServer.Siemens
         private static void ScanGraph(XElement graph, int network, List<PlcInputXmlUse> operands,
             IList<string> issues, IList<string> graphIssues)
         {
-            void ScanRegion(XElement container, string label, string? region, int? sequence, bool requiresNetwork)
+            void ScanRegion(XElement container, string label, string? region, int? sequence, bool requiresNetwork,
+                int? operationNumber = null)
             {
                 var regionIssues = region == null ? issues : graphIssues;
                 var networks = container.Elements().Where(e => Is(e, "FlgNet")).ToList();
@@ -102,7 +106,7 @@ namespace TiaMcpServer.Siemens
                 }
                 for (int i = 0; i < networks.Count; i++)
                     ScanBody(networks[i], network, $"{label}/NW{i + 1}", operands, regionIssues, region, sequence,
-                        transitionName, transitionNumber);
+                        transitionName, transitionNumber, operationNumber);
             }
 
             foreach (var section in graph.Elements().Where(e => e.Name.LocalName is "PreOperations" or "PostOperations"))
@@ -112,7 +116,10 @@ namespace TiaMcpServer.Siemens
                     graphIssues.Add($"{region}: unexpected GRAPH instruction container");
                 int index = 0;
                 foreach (var operation in section.Elements().Where(e => Is(e, "PermanentOperation")))
-                    ScanRegion(operation, $"NW{network}/{region}{++index}", region, null, false);
+                {
+                    index++;
+                    ScanRegion(operation, $"NW{network}/{region}{index}", region, null, false, index);
+                }
             }
 
             var sequences = graph.Elements().Where(e => Is(e, "Sequence")).ToList();
@@ -143,7 +150,8 @@ namespace TiaMcpServer.Siemens
 
         private static void ScanBody(XElement body, int network, string site, List<PlcInputXmlUse> operands,
             IList<string> issues, string? graphRegion = null, int? graphSequence = null,
-            string? transitionName = null, int? transitionNumber = null)
+            string? transitionName = null, int? transitionNumber = null, int? graphOperationNumber = null,
+            bool traceContacts = true)
         {
             int operand = 0;
             var graphical = Is(body, "FlgNet");
@@ -155,6 +163,10 @@ namespace TiaMcpServer.Siemens
                 .ToLookup(p => (string)p.Attribute("UId")!);
             var wiresById = wires?.Elements().SelectMany(w => w.Elements().Where(c => Is(c, "IdentCon") && c.Attribute("UId") != null)
                 .Select(c => (Id: (string)c.Attribute("UId")!, Wire: w))).ToLookup(c => c.Id, c => c.Wire);
+            var contactPorts = traceContacts ? wires?.Elements().SelectMany(w => w.Elements()
+                .Where(c => Is(c, "NameCon") && ((string?)c.Attribute("Name") is "in" or "out") && c.Attribute("UId") != null)
+                .Select(c => (Key: ((string)c.Attribute("UId")!, (string)c.Attribute("Name")!), Wire: w)))
+                .ToLookup(c => c.Key, c => c.Wire) : null;
             foreach (var node in body.Descendants().Where(e => e.Name.LocalName is "Access" or "Address" or "Token"))
             {
                 if (node.Ancestors().TakeWhile(a => a != body).Any(a => a.Name.LocalName is "LineComment" or "BlockComment" or "Comment" or "Title"))
@@ -166,7 +178,7 @@ namespace TiaMcpServer.Siemens
                 var use = new PlcInputXmlUse
                 {
                     Network = network, GraphRegion = graphRegion, GraphSequence = graphSequence,
-                    TransitionName = transitionName, TransitionNumber = transitionNumber,
+                    TransitionName = transitionName, TransitionNumber = transitionNumber, GraphOperationNumber = graphOperationNumber,
                 };
 
                 if (Is(node, "Access") && scope == "GlobalVariable")
@@ -195,8 +207,27 @@ namespace TiaMcpServer.Siemens
 
                 var uid = (string?)(access ?? node).Attribute("UId");
                 use.Site = $"{site}/{++operand}" + (uid == null ? "" : $" (UId {uid})");
-                if (graphical && uid != null && partsById != null && wiresById != null)
-                    use.Access = GraphicalAccess(wiresById[uid], partsById, use, issues);
+                if (graphical)
+                {
+                    var indexOwner = uid == null ? GraphicalArrayOwner(access) : null;
+                    var wiredAccess = indexOwner ?? access;
+                    var wireUid = (string?)wiredAccess?.Attribute("UId");
+                    if (wiredAccess != null && wireUid != null && partsById != null && wiresById != null
+                        && partsById[wireUid].SingleOrDefaultIfUnique() == wiredAccess
+                        && (indexOwner == null || wiresById[wireUid].Any(w => w.Elements().Any(p => Is(p, "NameCon")
+                            && ConnectedGraphicalPart(partsById, (string?)p.Attribute("UId"), (string?)p.Attribute("Name")) != null))))
+                    {
+                        // An array index is read to address the wired operand. It has no pin of its own.
+                        use.Access = indexOwner == null
+                            ? GraphicalAccess(wiresById[wireUid], partsById, contactPorts, use, issues)
+                            : "Read";
+                    }
+                    else
+                    {
+                        issues.Add($"{use.Site}: the FlgNet operand could not be matched to its wires");
+                        use.Confirmed = use.AccessComplete = false;
+                    }
+                }
                 else
                 {
                     var operandNode = access ?? node;
@@ -248,47 +279,164 @@ namespace TiaMcpServer.Siemens
             return true;
         }
 
+        private static XElement? GraphicalArrayOwner(XElement? access)
+        {
+            var component = access?.Parent;
+            var symbol = component?.Parent;
+            var owner = symbol?.Parent;
+            return component?.Name.LocalName == "Component" && (string?)component.Attribute("AccessModifier") == "Array"
+                && symbol?.Name.LocalName == "Symbol" && owner?.Name.LocalName == "Access" ? owner : null;
+        }
+
+        private static XElement? ConnectedGraphicalPart(ILookup<string, XElement> parts, string? uid, string? pin)
+        {
+            var part = parts[uid ?? ""].SingleOrDefaultIfUnique();
+            return !string.IsNullOrEmpty(pin) && part?.Name.LocalName is "Call" or "Part" ? part : null;
+        }
+
         private static string GraphicalAccess(IEnumerable<XElement> wires, ILookup<string, XElement> parts,
-            PlcInputXmlUse use, IList<string> issues)
+            ILookup<(string, string), XElement>? contactPorts, PlcInputXmlUse use, IList<string> issues)
         {
             var directions = new HashSet<string>();
-            var connectedPins = new HashSet<(string?, string?)>();
+            bool hasEndpoint = false;
+            var connectedPins = new HashSet<(string?, string?, PlcInputPinSource)>();
+            void AddPin(XElement? call, string? pin, string? section, string? uid, PlcInputPinSource source)
+            {
+                if (!connectedPins.Add((uid, pin, source))) return;
+                var connection = CallPin(call, pin, section, uid);
+                connection.Source = source;
+                use.Pins.Add(connection);
+            }
+
             foreach (var wire in wires)
             {
                 foreach (var port in wire.Elements().Where(c => Is(c, "NameCon")))
                 {
-                    var callUid = (string?)port.Attribute("UId");
-                    var matchingParts = parts[callUid ?? ""].ToList();
+                    var uid = (string?)port.Attribute("UId");
                     var pin = (string?)port.Attribute("Name");
-                    if (matchingParts.Count != 1)
+                    var part = ConnectedGraphicalPart(parts, uid, pin);
+                    if (part == null)
                     {
-                        issues.Add($"{use.Site}: could not resolve a unique part UId {callUid}");
+                        issues.Add($"{use.Site}: could not resolve a unique part or port for UId {uid}");
                         directions.Add("Unknown");
                         use.HasOtherWrite = true;
                         continue;
                     }
-                    var part = matchingParts[0];
+                    hasEndpoint = true;
                     if (Is(part, "Call"))
                     {
                         var call = Child(part, "CallInfo");
-                        var parameters = call?.Elements().Where(p => Is(p, "Parameter") && (string?)p.Attribute("Name") == pin).ToList();
-                        var section = parameters?.Count == 1 ? (string?)parameters[0].Attribute("Section") : pin == "en" ? "Input" : null;
+                        var parameter = CallParameter(call, pin!);
+                        var section = parameter == null ? pin == "en" ? "Input" : null : (string?)parameter.Attribute("Section");
                         directions.Add(SectionAccess(section));
-                        if (connectedPins.Add((callUid, pin)))
-                            use.Pins.Add(CallPin(call, pin, section, callUid));
+                        AddPin(call, pin, section, uid, PlcInputPinSource.Direct);
                     }
                     else
                     {
                         var access = InstructionAccess((string?)part.Attribute("Name"), pin);
                         directions.Add(access);
                         use.HasOtherWrite |= access == "Unknown" || PlcInputUsageAudit.IsWrite(access);
+                        if (contactPorts != null && pin == "operand" && ContactSource(part) is { } source
+                            && !TraceContactPins(uid!, parts, contactPorts, (call, name, section, callUid) =>
+                                AddPin(call, name, section, callUid, source)))
+                            use.CallPinTraceComplete = false;
                     }
                 }
             }
-            use.AccessComplete = !directions.Remove("Unknown");
+            use.Confirmed &= hasEndpoint;
+            use.AccessComplete = hasEndpoint && !directions.Remove("Unknown");
             if (directions.Count == 0) return "Unknown";
             if (directions.Count > 1) return "RW";
             return directions.Single();
+        }
+
+        private static XElement? CallParameter(XElement? call, string pin) => call?.Elements()
+            .Where(p => Is(p, "Parameter") && (string?)p.Attribute("Name") == pin).SingleOrDefaultIfUnique();
+
+        private static XElement? SingleOrDefaultIfUnique(this IEnumerable<XElement> elements)
+        {
+            using var iterator = elements.GetEnumerator();
+            if (!iterator.MoveNext()) return null;
+            var element = iterator.Current;
+            return iterator.MoveNext() ? null : element;
+        }
+
+        private static PlcInputPinSource? ContactSource(XElement part) => (string?)part.Attribute("Name") switch
+        {
+            "NegatedContact" => PlcInputPinSource.NegatedContact,
+            "Contact" => part.Elements().Any(e => Is(e, "Negated") && (string?)e.Attribute("Name") == "operand")
+                ? PlcInputPinSource.NegatedContact : PlcInputPinSource.Contact,
+            _ => null,
+        };
+
+        private static bool TraceContactPins(string start, ILookup<string, XElement> parts,
+            ILookup<(string, string), XElement> wiresByPort, Action<XElement, string, string?, string> addPin)
+        {
+            var pending = new Stack<string>();
+            var visited = new HashSet<string>();
+            var complete = true;
+            pending.Push(start);
+            while (pending.Count > 0)
+            {
+                var contact = pending.Pop();
+                if (!visited.Add(contact))
+                {
+                    complete = false;
+                    continue;
+                }
+                var wires = wiresByPort[(contact, "out")].ToList();
+                if (wires.Count == 0) continue;
+                if (wires.Count != 1)
+                {
+                    complete = false;
+                    continue;
+                }
+                // Qualifying inputs must be fed by the contact alone, even on a fan-out wire.
+                var targets = wires[0].Elements().Where(c => !Is(c, "OpenCon")
+                    && !(Is(c, "NameCon") && (string?)c.Attribute("UId") == contact && (string?)c.Attribute("Name") == "out"))
+                    .Select(port =>
+                    {
+                        var uid = (string?)port.Attribute("UId") ?? "";
+                        var pin = (string?)port.Attribute("Name") ?? "";
+                        var part = parts[uid].SingleOrDefaultIfUnique();
+                        var call = Child(part, "CallInfo");
+                        return (Port: port, Uid: uid, Pin: pin, Part: part, Call: call, Parameter: CallParameter(call, pin));
+                    }).ToList();
+                if (targets.Any(t => !Is(t.Port, "NameCon") || t.Part == null || t.Pin.Length == 0
+                    || !Is(t.Part, "Call") && !(Is(t.Part, "Part") && IsFlowInput(t.Part, t.Pin))
+                    || Is(t.Part, "Call") && (t.Call == null || t.Parameter == null && t.Pin != "en")))
+                {
+                    complete = false;
+                    continue;
+                }
+                var hasOtherDriver = targets.Any(t => (string?)t.Parameter?.Attribute("Section") is "Output" or "Return");
+                foreach (var (_, uid, pin, part, call, parameter) in targets)
+                {
+                    if (parameter != null)
+                    {
+                        var section = (string?)parameter.Attribute("Section");
+                        if (!hasOtherDriver || section is "Output" or "Return")
+                            addPin(call!, pin, section, uid);
+                        else complete = false;
+                    }
+                    else if (Is(part!, "Part") && ContactSource(part!) != null)
+                    {
+                        if (!hasOtherDriver && wiresByPort[(uid, "in")].Count() == 1) pending.Push(uid);
+                        else complete = false;
+                    }
+                }
+            }
+            return complete;
+        }
+
+        private static bool IsFlowInput(XElement part, string pin)
+        {
+            if (ContactSource(part) != null) return pin == "in";
+            var name = (string?)part.Attribute("Name");
+            return !string.IsNullOrEmpty(name) && (pin is "en" or "pre" or "s" or "r"
+                || pin.StartsWith("in", StringComparison.OrdinalIgnoreCase) && pin.Skip(2).All(char.IsDigit)
+                || name == "CTU" && pin == "CU" || name == "CTD" && pin == "CD"
+                || name == "CTUD" && (pin is "CU" or "CD"));
         }
 
         internal static PlcInputCallPin CallPin(XElement? call, string? pin, string? section, string? callUid)

@@ -2,7 +2,9 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 
 namespace TiaMcpServer.Siemens
@@ -72,6 +74,13 @@ namespace TiaMcpServer.Siemens
         TechnologyObject,
     }
 
+    internal enum PlcInputPinSource
+    {
+        Direct,
+        Contact,
+        NegatedContact,
+    }
+
     internal sealed class PlcInputCallPin
     {
         internal string? BlockType { get; set; }
@@ -84,6 +93,7 @@ namespace TiaMcpServer.Siemens
         internal string? CallUid { get; set; }
         internal string? Pin { get; set; }
         internal string? Direction { get; set; }
+        internal PlcInputPinSource Source { get; set; }
         internal bool Confirmed => BlockNumber.HasValue && !string.IsNullOrWhiteSpace(BlockName)
             && (BlockType is "FB" or "FC") && !string.IsNullOrWhiteSpace(Pin)
             && (Direction is "Input" or "InOut" or "Output" or "Return");
@@ -107,6 +117,7 @@ namespace TiaMcpServer.Siemens
         internal bool AccessComplete { get; set; } = true;
         internal bool HasOtherWrite { get; set; }
         internal bool NetworkScanComplete { get; set; }
+        internal bool CallPinTraceComplete { get; set; } = true;
         internal string? Location { get; set; }
         internal string? Detail { get; set; }
         internal string? Address { get; set; }
@@ -118,13 +129,15 @@ namespace TiaMcpServer.Siemens
         internal string? Symbol { get; set; }
         internal string[]? SymbolComponents { get; set; }
         internal string? GraphRegion { get; set; }
+        internal int? GraphOperationNumber { get; set; }
         internal string? TransitionName { get; set; }
         internal int? TransitionNumber { get; set; }
         internal int? GraphSequence { get; set; }
         internal List<PlcInputCallPin> CallPins { get; } = new List<PlcInputCallPin>();
         internal IReadOnlyList<PlcInputCallPin> SimaticMlPins => Origin == "simaticML" ? CallPins : Array.Empty<PlcInputCallPin>();
         internal bool IsDirectInOutWrite => ConfirmedUsage && AccessComplete && !HasOtherWrite
-            && (Access is "RW" or "ReadWriteAndSymbol") && SimaticMlPins.Any(p => p.Direction == "InOut")
+            && (Access is "RW" or "ReadWriteAndSymbol")
+            && SimaticMlPins.Any(p => p.Source == PlcInputPinSource.Direct && p.Direction == "InOut")
             && SimaticMlPins.All(p => p.Direction is "Input" or "InOut");
 
         internal JsonObject ToJson(bool inOutWriteAllowed = false, PlcInputAuditReference? caller = null) => new JsonObject
@@ -137,7 +150,8 @@ namespace TiaMcpServer.Siemens
             ["inOutWriteAllowed"] = inOutWriteAllowed,
             ["address"] = Address, ["origin"] = Origin, ["absolute"] = Absolute, ["confirmedUsage"] = ConfirmedUsage,
             ["network"] = Network, ["symbol"] = Symbol, ["graphRegion"] = GraphRegion,
-            ["transitionName"] = TransitionName, ["transitionNumber"] = TransitionNumber, ["graphSequence"] = GraphSequence,
+            ["transitionName"] = TransitionName, ["transitionNumber"] = TransitionNumber,
+            ["graphSequence"] = GraphSequence, ["graphOperationNumber"] = GraphOperationNumber,
             ["callPins"] = new JsonArray(SimaticMlPins.Select(p => (JsonNode)p.ToJson()).ToArray()),
         };
     }
@@ -158,13 +172,38 @@ namespace TiaMcpServer.Siemens
         internal List<string> ReferenceIssues { get; } = new List<string>();
     }
 
+    public sealed class PlcInputAllowedUsage
+    {
+        [JsonPropertyName("fbReadOnly")] public PlcInputAuditCallerRule FbReadOnly { get; set; } = new PlcInputAuditCallerRule();
+        [JsonPropertyName("callPinTarget")] public PlcInputAuditPinRule CallPinTarget { get; set; } = new PlcInputAuditPinRule();
+    }
+
+    public sealed class PlcInputAuditCallerRule
+    {
+        [JsonPropertyName("enabled")] public bool? Enabled { get; set; }
+        [JsonPropertyName("targetBlockType")] public string? TargetBlockType { get; set; }
+        [JsonPropertyName("targetBlockNumber")] public int TargetBlockNumber { get; set; }
+        [JsonPropertyName("targetLanguage")] public string? TargetLanguage { get; set; }
+    }
+
+    public sealed class PlcInputAuditPinRule
+    {
+        [JsonPropertyName("enabled")] public bool? Enabled { get; set; }
+        [JsonPropertyName("targetBlockType")] public string? TargetBlockType { get; set; }
+        [JsonPropertyName("targetBlockNumber")] public int? TargetBlockNumber { get; set; }
+        [JsonPropertyName("targetBlockName")] public string? TargetBlockName { get; set; }
+    }
+
     internal sealed class PlcInputUsageAudit
     {
+        private static readonly Regex NativeGraphOperation = new Regex(
+            @"(?:^| ▶ )(?<side>前|后)(?:永久|固定)指令\s+(?<number>[0-9]+)(?=\s|$)", RegexOptions.CultureInvariant);
+
         internal PlcInputUsageAudit(string[] addressRanges, bool commentEnabled, string[]? keywords,
             bool blockEnabled, string blockType, int blockNumber, string language,
             bool callPinEnabled = false, string? callBlockType = null, int? callBlockNumber = null,
             string? callBlockName = null, bool graphEnabled = false,
-            int[]? skipFbNumbers = null, string[]? skipFbNames = null)
+            int[]? skipFbNumbers = null, string[]? skipFbNames = null, PlcInputAllowedUsage[]? allowedUsages = null)
         {
             if (addressRanges == null || addressRanges.Length == 0)
                 throw new ArgumentException("addressRanges requires at least one input address or inclusive range.");
@@ -176,14 +215,16 @@ namespace TiaMcpServer.Siemens
             CommentEnabled = commentEnabled;
             Keywords = (keywords ?? new[] { "气缸" }).Select(k => k?.Trim() ?? "")
                 .Where(k => k.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
-            BlockEnabled = blockEnabled;
+            if (allowedUsages is { Length: 0 }) throw new ArgumentException("allowedUsages requires at least one caller/callee pair.");
+            AllowedUsages = allowedUsages?.Select(NormalizeAllowedUsage).ToArray();
+            BlockEnabled = blockEnabled || AllowedUsages != null;
             BlockType = (blockType ?? "").Trim().ToUpperInvariant();
             BlockNumber = blockNumber;
             Language = (language ?? "").Trim().ToUpperInvariant();
-            if (blockEnabled && (BlockType != "FB" && BlockType != "FC" && BlockType != "OB"
+            if (AllowedUsages == null && blockEnabled && (BlockType != "FB" && BlockType != "FC" && BlockType != "OB"
                 || BlockNumber < 1 || Language.Length == 0))
                 throw new ArgumentException("The enabled block rule requires FB, FC or OB, a positive block number and a language.");
-            CallPinEnabled = callPinEnabled;
+            CallPinEnabled = callPinEnabled || AllowedUsages != null;
             CallBlockType = (callBlockType ?? "").Trim().ToUpperInvariant();
             CallBlockNumber = callBlockNumber;
             CallBlockName = (callBlockName ?? "").Trim();
@@ -192,8 +233,29 @@ namespace TiaMcpServer.Siemens
                 throw new ArgumentException("Skip FB selectors must be positive block numbers or nonempty names.");
             SkipFbNumbers = new HashSet<int>(skipFbNumbers ?? Array.Empty<int>());
             SkipFbNames = new HashSet<string>((skipFbNames ?? Array.Empty<string>()).Select(n => n.Trim()), StringComparer.OrdinalIgnoreCase);
-            if (CallPinEnabled && (CallBlockType is not ("FB" or "FC") || CallBlockNumber is not > 0 || CallBlockName.Length == 0))
+            if (AllowedUsages == null && CallPinEnabled && (CallBlockType is not ("FB" or "FC") || CallBlockNumber is not > 0 || CallBlockName.Length == 0))
                 throw new ArgumentException("The enabled call pin rule requires FB or FC, a positive block number and a nonempty block name.");
+        }
+
+        private static PlcInputAllowedUsage NormalizeAllowedUsage(PlcInputAllowedUsage? usage, int index)
+        {
+            var caller = usage?.FbReadOnly;
+            var callee = usage?.CallPinTarget;
+            var callerType = caller?.TargetBlockType?.Trim().ToUpperInvariant();
+            var language = caller?.TargetLanguage?.Trim().ToUpperInvariant();
+            var calledType = callee?.TargetBlockType?.Trim().ToUpperInvariant();
+            var calledName = callee?.TargetBlockName?.Trim();
+            if (caller?.Enabled == null || callerType is not ("FB" or "FC" or "OB") || caller.TargetBlockNumber < 1
+                || string.IsNullOrEmpty(language) || callee?.Enabled == null || calledType is not ("FB" or "FC")
+                || callee.TargetBlockNumber is <= 0 || (callee.TargetBlockNumber == null && string.IsNullOrEmpty(calledName)))
+                throw new ArgumentException($"allowedUsages[{index}] requires fbReadOnly with caller type, number and language, and callPinTarget with FB/FC type and a positive number or name. Both objects require enabled.");
+            return new PlcInputAllowedUsage
+            {
+                FbReadOnly = new PlcInputAuditCallerRule { Enabled = caller.Enabled, TargetBlockType = callerType,
+                    TargetBlockNumber = caller.TargetBlockNumber, TargetLanguage = language },
+                CallPinTarget = new PlcInputAuditPinRule { Enabled = callee.Enabled, TargetBlockType = calledType,
+                    TargetBlockNumber = callee.TargetBlockNumber, TargetBlockName = string.IsNullOrEmpty(calledName) ? null : calledName },
+            };
         }
 
         private PlcInputSpan[] Ranges { get; }
@@ -209,6 +271,7 @@ namespace TiaMcpServer.Siemens
         private string CallBlockType { get; }
         private int? CallBlockNumber { get; }
         private string CallBlockName { get; }
+        private PlcInputAllowedUsage[]? AllowedUsages { get; }
         private HashSet<int> SkipFbNumbers { get; }
         private HashSet<string> SkipFbNames { get; }
         internal bool SkipBlock(string type, int number, string name)
@@ -264,11 +327,12 @@ namespace TiaMcpServer.Siemens
         {
             var distinct = references.GroupBy(r => (r.BlockPath, r.BlockType, r.BlockNumber, r.Language, r.Access, r.AccessComplete,
                 r.Location, r.Detail, r.Address, r.Origin, r.Absolute, r.ConfirmedUsage, r.Symbol,
-                r.GraphRegion, r.TransitionNumber, r.GraphSequence, r.HasOtherWrite, r.IsDirectInOutWrite)).Select(g => g.First()).ToList();
+                r.GraphRegion, r.TransitionNumber, r.GraphSequence, r.HasOtherWrite, r.IsDirectInOutWrite,
+                r.CallPinTraceComplete)).Select(g => g.First()).ToList();
             // Native records identify a network. XML identifies the individual wire or token inside it.
-            var xml = distinct.Where(r => r.Origin == "simaticML" && r.Absolute && r.Network.HasValue)
+            var xml = distinct.Where(r => r.Origin == "simaticML" && r.Absolute && r.Network.HasValue && r.ConfirmedUsage)
                 .ToLookup(MatchingAbsoluteAccess);
-            return distinct.Where(r => r.Origin != "crossReference" || !r.Absolute || !r.Network.HasValue
+            return distinct.Where(r => r.Origin != "crossReference" || !r.Absolute || !r.Network.HasValue || !r.ConfirmedUsage
                 || !xml.Contains(MatchingAbsoluteAccess(r))
                 || xml[MatchingAbsoluteAccess(r)].Any(match => match.IsDirectInOutWrite)).ToList();
         }
@@ -286,33 +350,47 @@ namespace TiaMcpServer.Siemens
                 ? components.Length == 1 && string.Equals(pointName, components[0], StringComparison.OrdinalIgnoreCase)
                 : NativeSymbolMatches(native.Symbol, components));
 
-        private static JsonArray ReportReferences(List<PlcInputAuditReference> references,
-            HashSet<PlcInputAuditReference> allowedInOut, string? pointName)
+        private static (Dictionary<PlcInputAuditReference, PlcInputAuditReference> Callers,
+            HashSet<PlcInputAuditReference> CoveredNative) FindMatchingReferences(
+            List<PlcInputAuditReference> references, string? pointName, bool includeAbsolute)
         {
             // Keep both sources for rule evaluation. Suppress only a network-level summary
             // that is represented by a confirmed, matching XML site in the result.
-            var comparable = references.Where(r => !r.Absolute && r.BlockPath != null && r.Network.HasValue
-                && r.Language != "GRAPH" && r.ConfirmedUsage && r.AccessComplete
-                && (IsRead(r.Access) || IsWrite(r.Access)));
-            var operands = comparable.Where(r => r.Origin == "simaticML")
-                .ToLookup(r => (r.BlockPath, r.Network, r.Language, AccessKind(r.Access)));
+            var comparable = references.Where(r => (!r.Absolute || includeAbsolute) && r.BlockPath != null && r.ConfirmedUsage
+                && r.AccessComplete && (IsRead(r.Access) || IsWrite(r.Access)))
+                .Select(r => (Reference: r, Site: Site(r)))
+                .Where(r => r.Site.Network.HasValue || r.Site.Operation.HasValue);
+            var operands = comparable.Where(r => r.Reference.Origin == "simaticML")
+                .ToLookup(r => (r.Reference.BlockPath, r.Reference.Language, AccessKind(r.Reference.Access), r.Reference.Absolute, r.Site), r => r.Reference);
             var callerByOperand = new Dictionary<PlcInputAuditReference, PlcInputAuditReference>();
             var coveredNative = new HashSet<PlcInputAuditReference>();
-            foreach (var native in comparable.Where(r => r.Origin == "crossReference"))
+            foreach (var (native, site) in comparable.Where(r => r.Reference.Origin == "crossReference"))
             {
-                foreach (var operand in operands[(native.BlockPath, native.Network, native.Language, AccessKind(native.Access))])
+                var matches = operands[(native.BlockPath, native.Language, AccessKind(native.Access), native.Absolute, site)]
+                    .Where(r => native.Absolute ? native.Address != null && r.Address == native.Address
+                        : MatchesSymbol(native, r, pointName)).ToList();
+                // A GRAPH operation number is scoped to its region within one compile unit.
+                if (site.Operation.HasValue && (matches.Select(r => r.Network).Distinct().Count() != 1
+                    || matches.Any(r => !r.NetworkScanComplete || !r.Network.HasValue
+                        || native.Network.HasValue && r.Network != native.Network))) continue;
+                foreach (var operand in matches)
                 {
-                    if (!MatchesSymbol(native, operand, pointName)) continue;
                     if (!callerByOperand.ContainsKey(operand)) callerByOperand.Add(operand, native);
                     coveredNative.Add(native);
                 }
             }
 
-            return new JsonArray(references.Where(r => !coveredNative.Contains(r)).Select(r =>
+            return (callerByOperand, coveredNative);
+
+            static (int? Network, string? Region, int? Operation) Site(PlcInputAuditReference reference)
             {
-                callerByOperand.TryGetValue(r, out var caller);
-                return (JsonNode)r.ToJson(allowedInOut.Contains(r), caller);
-            }).ToArray());
+                if (reference.Language != "GRAPH") return (reference.Network, null, null);
+                if (reference.Origin == "simaticML") return (null, reference.GraphRegion, reference.GraphOperationNumber);
+                var match = NativeGraphOperation.Match(reference.Location ?? "");
+                return int.TryParse(match.Groups["number"].Value, out var number) && number > 0
+                    ? (null, match.Groups["side"].Value == "前" ? "PermanentPreInstructions" : "PermanentPostInstructions", number)
+                    : default;
+            }
         }
 
         internal static bool NativeSymbolMatches(string? native, string[] components)
@@ -352,9 +430,10 @@ namespace TiaMcpServer.Siemens
             var counts = new Dictionary<string, int>(StringComparer.Ordinal)
             {
                 ["PASS"] = 0, ["FAIL"] = 0, ["INCOMPLETE"] = 0, ["NOT_EVALUATED"] = 0,
-                ["EXCLUDED"] = 0, ["UNUSED"] = 0, ["SAFETY_ONLY"] = 0,
+                ["EXCLUDED"] = 0, ["UNUSED"] = 0,
             };
             int used = 0, partial = 0, tags = 0, absoluteOnly = 0, callerFailures = 0, pinFailures = 0, graphFailures = 0;
+            int safetyOnlyExcluded = 0, commentFailures = 0;
             var rulesEnabled = BlockEnabled || CallPinEnabled || GraphEnabled;
             bool anyIncomplete = false;
             foreach (var point in points.Where(p => InRange(p.Span)).OrderBy(p => p.Span.Start).ThenBy(p => p.Name, StringComparer.Ordinal))
@@ -362,39 +441,63 @@ namespace TiaMcpServer.Siemens
                 if (point.Table == null) absoluteOnly++;
                 else tags++;
                 var references = DistinctReferences(point.References);
+                var hasUse = references.Any(r => r.ConfirmedUsage);
+                var identityComplete = inventoryComplete && point.ReferencesComplete && point.SymbolScanComplete
+                    && references.All(r => r.ConfirmedUsage);
+                var usageComplete = identityComplete && absoluteScanComplete && graphScanComplete && point.GraphSymbolScanComplete;
+                if (!hasUse && usageComplete && (!CallPinEnabled || callPinScanComplete))
+                {
+                    counts["UNUSED"]++;
+                    if (point.HasSafetyUse) safetyOnlyExcluded++;
+                    continue;
+                }
+                var commentError = point.Comment.ContainsKey("_error");
+                var comments = point.Comment.Where(c => c.Key != "_error" && c.Value is JsonValue value
+                    && value.TryGetValue<string>(out _)).Select(c => c.Value!.GetValue<string>()).ToArray();
+                var excluded = CommentEnabled && comments.Any(comment =>
+                    Keywords.Any(k => comment.IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0));
+                var (callers, coveredNative) = FindMatchingReferences(references, point.Name, AllowedUsages != null);
                 var xmlByBlock = references.Where(r => r.Origin == "simaticML")
                     .ToLookup(r => (r.BlockPath, r.Absolute));
                 var allowedInOut = new HashSet<PlcInputAuditReference>();
-                var hasUse = references.Any(r => r.ConfirmedUsage);
+                var assessments = new Dictionary<PlcInputAuditReference, (JsonObject Use, List<JsonObject> Pins)>();
                 var reasons = new List<string>();
                 var violations = new JsonArray();
                 var pinConnections = new JsonArray();
                 var graphLocations = new JsonArray();
-                var commentError = point.Comment.ContainsKey("_error");
-                var excluded = CommentEnabled && point.Comment.Any(c => c.Key != "_error"
-                    && c.Value is JsonValue value && value.TryGetValue<string>(out var comment)
-                    && Keywords.Any(k => comment.IndexOf(k, StringComparison.OrdinalIgnoreCase) >= 0));
-                var identityComplete = inventoryComplete && point.ReferencesComplete && point.SymbolScanComplete
-                    && references.All(r => r.ConfirmedUsage);
-                var usageComplete = identityComplete && absoluteScanComplete;
+                var checkComment = !excluded && hasUse && point.Name != null;
+                var commentFail = checkComment && !commentError && comments.All(string.IsNullOrWhiteSpace);
+                var commentStatus = excluded ? "EXCLUDED" : !checkComment ? "NOT_EVALUATED"
+                    : commentError ? "INCOMPLETE" : commentFail ? "FAIL" : "PASS";
+                JsonObject? commentViolation = null;
                 var callerComplete = usageComplete;
                 var pinComplete = usageComplete && callPinScanComplete;
                 var graphComplete = inventoryComplete && graphScanComplete && point.GraphSymbolScanComplete
                     && references.All(r => r.GraphRegion == null || r.ConfirmedUsage);
-                bool callerFail = false, pinFail = false, graphFail = false, targetInput = false;
+                bool callerFail = false, pinFail = false, graphFail = false, hasTargetConnection = false;
 
-                void Violation(string rule, string code, string message, PlcInputAuditReference? reference = null)
+                JsonObject Violation(string rule, string code, string message, PlcInputAuditReference? reference = null)
                 {
-                    violations.Add(new JsonObject
+                    var violation = new JsonObject
                     {
                         ["rule"] = rule, ["code"] = code, ["message"] = message,
                         ["blockPath"] = reference?.BlockPath, ["location"] = reference?.Location,
-                    });
+                    };
+                    violations.Add(violation);
+                    return violation;
                 }
 
                 if (!excluded)
                 {
-                    if (CommentEnabled && commentError) reasons.Add("Multilingual comments could not be read completely.");
+                    if (commentFail)
+                    {
+                        commentViolation = new JsonObject
+                        {
+                            ["rule"] = "comment", ["code"] = "MISSING_INPUT_COMMENT", ["message"] = "I 点缺少注释。",
+                        };
+                        violations.Add(commentViolation);
+                    }
+                    if (checkComment && commentError) reasons.Add("Multilingual comments could not be read completely.");
                     if (!inventoryComplete) reasons.Add("The standard-program inventory is incomplete.");
                     if (!point.ReferencesComplete)
                     {
@@ -404,46 +507,109 @@ namespace TiaMcpServer.Siemens
                     if (!point.SymbolScanComplete) reasons.Add("An XML symbol could not be resolved to a unique input identity.");
                     if (!absoluteScanComplete) reasons.Add("The absolute-address scan is incomplete.");
                     if (CallPinEnabled && !callPinScanComplete) reasons.Add("The call-pin scan is incomplete.");
-                    if (GraphEnabled && !graphScanComplete) reasons.Add("The GRAPH scan is incomplete.");
-                    if (GraphEnabled && !point.GraphSymbolScanComplete) reasons.Add("A GRAPH symbol could not be resolved to a unique input identity.");
+                    if (!graphScanComplete) reasons.Add("The GRAPH scan is incomplete.");
+                    if (!point.GraphSymbolScanComplete) reasons.Add("A GRAPH symbol could not be resolved to a unique input identity.");
                 }
                 foreach (var reference in references)
                 {
                     var site = (reference.BlockPath ?? "(unresolved user)") + " " + reference.Location;
+                    var useViolations = new List<JsonObject>();
+                    var pinAssessments = new List<JsonObject>();
+                    var callerUseComplete = reference.ConfirmedUsage;
+                    bool callerUseFail = false, graphUseFail = false;
+                    var callerIdentityComplete = reference.BlockType != null && reference.BlockNumber.HasValue && reference.Language != null;
+                    int CallerDifferences(PlcInputAllowedUsage rule)
+                        => (reference.BlockType != null && reference.BlockType != rule.FbReadOnly.TargetBlockType ? 1 : 0)
+                            + (reference.BlockNumber.HasValue && reference.BlockNumber != rule.FbReadOnly.TargetBlockNumber ? 1 : 0)
+                            + (reference.Language != null && !string.Equals(reference.Language, rule.FbReadOnly.TargetLanguage, StringComparison.OrdinalIgnoreCase) ? 1 : 0);
+                    var callerOptions = AllowedUsages?.Where(rule => CallerDifferences(rule) == 0).ToList();
                     var (inOutAllowed, inOutUnconfirmed) = InOutWriteAssessment(reference, xmlByBlock, point.Name);
                     if (inOutAllowed) allowedInOut.Add(reference);
                     if (!excluded && !reference.ConfirmedUsage)
                         reasons.Add($"{site}: the usage could not be confirmed.");
+                    if (CallPinEnabled && !excluded && !reference.CallPinTraceComplete)
+                    {
+                        pinComplete = false;
+                        reasons.Add($"{site}: the LAD contact output could not be traced unambiguously.");
+                    }
                     if (BlockEnabled && !excluded && reference.ConfirmedUsage)
                     {
-                        if (reference.BlockType != null && reference.BlockType != BlockType
-                            || reference.BlockNumber.HasValue && reference.BlockNumber != BlockNumber
-                            || reference.Language != null && !string.Equals(reference.Language, Language, StringComparison.OrdinalIgnoreCase))
+                        void CheckCaller(string field, string expected, string? actual)
                         {
-                            callerFail = true;
-                            Violation("caller", "WRONG_CALLER", $"{site}: expected {BlockType}{BlockNumber} {Language}, found {reference.BlockType}{reference.BlockNumber} {reference.Language}.", reference);
+                            if (actual == null || string.Equals(expected, actual, StringComparison.OrdinalIgnoreCase)) return;
+                            callerFail = callerUseFail = true;
+                            var violation = Violation("caller", "WRONG_CALLER", $"{site}: expected caller {field} {expected}, found {actual}.", reference);
+                            violation["field"] = field;
+                            violation["expected"] = expected;
+                            violation["actual"] = actual;
+                            useViolations.Add(violation);
                         }
-                        if (reference.BlockType == null || !reference.BlockNumber.HasValue || reference.Language == null)
+                        if (callerOptions == null || callerOptions.Count == 0)
                         {
-                            callerComplete = false;
+                            var closest = AllowedUsages?.OrderBy(CallerDifferences).First().FbReadOnly;
+                            CheckCaller("blockType", closest?.TargetBlockType ?? BlockType, reference.BlockType);
+                            CheckCaller("blockNumber", (closest?.TargetBlockNumber ?? BlockNumber).ToString(CultureInfo.InvariantCulture),
+                                reference.BlockNumber?.ToString(CultureInfo.InvariantCulture));
+                            CheckCaller("language", closest?.TargetLanguage ?? Language, reference.Language);
+                        }
+                        if (!callerIdentityComplete)
+                        {
+                            callerComplete = callerUseComplete = false;
                             reasons.Add($"{site}: the caller block properties could not be confirmed.");
                         }
-                        if (inOutUnconfirmed)
+                        if (AllowedUsages == null && inOutUnconfirmed)
                         {
-                            callerComplete = false;
+                            callerComplete = callerUseComplete = false;
                             reasons.Add($"{site}: the native write could not be attributed exclusively to the verified InOut connection.");
                         }
-                        else if (IsWrite(reference.Access) && !inOutAllowed)
+                        else if (AllowedUsages == null && IsWrite(reference.Access) && !inOutAllowed)
                         {
-                            callerFail = true;
-                            Violation("caller", "NOT_READ_ONLY", $"{site}: {reference.Access} is not read-only.", reference);
+                            callerFail = callerUseFail = true;
+                            useViolations.Add(Violation("caller", "NOT_READ_ONLY", $"{site}: {reference.Access} is not read-only.", reference));
                         }
-                        if (!reference.AccessComplete || (!IsRead(reference.Access) && !IsWrite(reference.Access)))
+                        if (AllowedUsages == null && (!reference.AccessComplete || (!IsRead(reference.Access) && !IsWrite(reference.Access))))
                         {
-                            callerComplete = false;
+                            callerComplete = callerUseComplete = false;
                             reasons.Add($"{site}: unconfirmed access ({reference.Access ?? "undefined"}).");
                         }
                     }
+                    if (reference.GraphRegion != null)
+                    {
+                        var graphLocation = reference.ToJson();
+                        graphLocation["inputAddress"] = point.Address;
+                        graphLocation["inputName"] = point.Name;
+                        graphLocations.Add(graphLocation);
+                        if (GraphEnabled && !excluded && reference.ConfirmedUsage)
+                        {
+                            graphFail = graphUseFail = true;
+                            var violation = Violation("graphDirectUse", "DIRECT_GRAPH_INPUT", $"{site}: direct input use in {reference.GraphRegion}.", reference);
+                            violation["graphRegion"] = reference.GraphRegion;
+                            useViolations.Add(violation);
+                        }
+                    }
+                    var graphUseComplete = reference.ConfirmedUsage && (reference.GraphRegion != null
+                        || reference.Language != null && (reference.Language != "GRAPH" || reference.Origin == "simaticML"));
+                    var useGraphStatus = RuleStatus(GraphEnabled, graphUseFail, graphUseComplete);
+                    JsonObject AssessUse(bool callerFailed, bool callerConfirmed, string usePinStatus, bool pinUseComplete,
+                        IEnumerable<JsonObject> rowViolations)
+                    {
+                        var useCallerStatus = RuleStatus(BlockEnabled, callerFailed, callerConfirmed);
+                        var useCommentStatus = reference.ConfirmedUsage ? commentStatus : "NOT_EVALUATED";
+                        var statuses = new[] { useCallerStatus, usePinStatus, useGraphStatus, useCommentStatus };
+                        if (reference.ConfirmedUsage && commentViolation != null)
+                            rowViolations = rowViolations.Append(commentViolation);
+                        return new JsonObject
+                        {
+                            ["callerRuleStatus"] = useCallerStatus, ["callPinRuleStatus"] = usePinStatus,
+                            ["graphDirectUseStatus"] = useGraphStatus, ["commentStatus"] = useCommentStatus,
+                            ["status"] = statuses.Contains("FAIL") ? "FAIL" : statuses.Contains("INCOMPLETE") ? "INCOMPLETE"
+                                : statuses.Contains("PASS") ? "PASS" : "NOT_EVALUATED",
+                            ["complete"] = !statuses.Contains("INCOMPLETE") && (excluded
+                                || (!BlockEnabled || callerConfirmed) && (!CallPinEnabled || pinUseComplete)),
+                            ["violations"] = new JsonArray(rowViolations.Select(v => v.DeepClone()).ToArray()),
+                        };
+                    }
+
                     foreach (var pin in reference.SimaticMlPins)
                     {
                         var connection = pin.ToJson();
@@ -455,65 +621,139 @@ namespace TiaMcpServer.Siemens
                         connection["location"] = reference.Location;
                         connection["confirmed"] = pin.Confirmed && reference.ConfirmedUsage;
                         pinConnections.Add(connection);
-                        if (!CallPinEnabled || excluded || !reference.ConfirmedUsage) continue;
-                        var wrongDirection = pin.Direction is "Output" or "Return";
-                        var wrongTarget = pin.BlockNumber.HasValue && (pin.BlockType != CallBlockType
-                            || pin.BlockNumber != CallBlockNumber || !string.Equals(pin.BlockName, CallBlockName, StringComparison.OrdinalIgnoreCase));
-                        if (wrongDirection || wrongTarget)
+                        var pinViolations = new List<JsonObject>();
+                        bool rowCallerFail = callerUseFail, rowCallerComplete = callerUseComplete, rowPinFail = false;
+                        var pinUseComplete = reference.ConfirmedUsage && pin.Confirmed
+                            && (AllowedUsages == null || callerIdentityComplete);
+                        if (CallPinEnabled && !excluded && reference.ConfirmedUsage)
                         {
-                            pinFail = true;
-                            Violation("callPin", wrongDirection ? "OUTPUT_OR_RETURN" : "WRONG_CALLED_BLOCK",
-                                $"{site}: {pin.BlockType} {pin.BlockName} ({pin.BlockNumber}) pin {pin.Pin} ({pin.Direction}).", reference);
+                            var outputOrReturn = pin.Direction is "Output" or "Return";
+                            var wrongDirection = AllowedUsages == null && outputOrReturn;
+                            bool wrongTarget = false, wrongPair = false;
+                            if (pin.BlockNumber.HasValue)
+                            {
+                                if (AllowedUsages == null)
+                                    wrongTarget = pin.BlockType != CallBlockType || pin.BlockNumber != CallBlockNumber
+                                        || !string.Equals(pin.BlockName, CallBlockName, StringComparison.OrdinalIgnoreCase);
+                                else
+                                {
+                                    bool MatchesTarget(PlcInputAllowedUsage rule) => pin.BlockType == rule.CallPinTarget.TargetBlockType
+                                        && (!rule.CallPinTarget.TargetBlockNumber.HasValue || pin.BlockNumber == rule.CallPinTarget.TargetBlockNumber)
+                                        && (rule.CallPinTarget.TargetBlockName == null || pin.BlockName == null
+                                            || string.Equals(pin.BlockName, rule.CallPinTarget.TargetBlockName, StringComparison.OrdinalIgnoreCase));
+                                    wrongTarget = !AllowedUsages.Any(MatchesTarget);
+                                    var matchingPairs = callerOptions!.Where(MatchesTarget).ToList();
+                                    wrongPair = !wrongTarget && matchingPairs.Count == 0;
+                                    if (matchingPairs.Count > 0)
+                                    {
+                                        var accessKnown = reference.AccessComplete && !inOutUnconfirmed
+                                            && (IsRead(reference.Access) || IsWrite(reference.Access));
+                                        var policy = matchingPairs.Select(rule => (
+                                            DirectionMismatch: rule.CallPinTarget.Enabled == true && outputOrReturn,
+                                            AccessMismatch: rule.FbReadOnly.Enabled == true && accessKnown && IsWrite(reference.Access) && !inOutAllowed,
+                                            AccessUnconfirmed: rule.FbReadOnly.Enabled == true && !accessKnown))
+                                            .OrderBy(p => (p.DirectionMismatch ? 1 : 0) + (p.AccessMismatch ? 1 : 0))
+                                            .ThenBy(p => p.AccessUnconfirmed).First();
+                                        wrongDirection = policy.DirectionMismatch;
+                                        if (policy.AccessMismatch)
+                                        {
+                                            callerFail = rowCallerFail = true;
+                                            pinViolations.Add(Violation("caller", "NOT_READ_ONLY", $"{site}: {reference.Access} is not read-only.", reference));
+                                        }
+                                        if (policy.AccessUnconfirmed)
+                                        {
+                                            callerComplete = rowCallerComplete = pinComplete = false;
+                                            reasons.Add($"{site}: read-only access for this caller/callee pair could not be confirmed.");
+                                        }
+                                    }
+                                }
+                            }
+                            var description = $"{site}: {pin.BlockType} {pin.BlockName} ({pin.BlockNumber}) pin {pin.Pin} ({pin.Direction}).";
+                            if (wrongDirection) pinViolations.Add(Violation("callPin", "OUTPUT_OR_RETURN", description, reference));
+                            if (wrongTarget) pinViolations.Add(Violation("callPin", "WRONG_CALLED_BLOCK", description, reference));
+                            if (wrongPair) pinViolations.Add(Violation("callPin", "WRONG_CALL_PAIR",
+                                $"{description} The caller and call target do not match the same allowed pair.", reference));
+                            rowPinFail = wrongDirection || wrongTarget || wrongPair;
+                            pinFail |= rowPinFail;
+                            if (!pinUseComplete)
+                            {
+                                pinComplete = false;
+                                reasons.Add($"{site}: call target or pin direction could not be confirmed.");
+                            }
+                            else if (!rowPinFail && (AllowedUsages == null || !rowCallerFail && rowCallerComplete))
+                                hasTargetConnection = true;
                         }
-                        if (!pin.Confirmed)
-                        {
-                            pinComplete = false;
-                            reasons.Add($"{site}: call target or pin direction could not be confirmed.");
-                        }
-                        else if (!wrongDirection && !wrongTarget) targetInput = true;
+                        var usePinStatus = RuleStatus(CallPinEnabled, rowPinFail, pinUseComplete);
+                        pinAssessments.Add(AssessUse(rowCallerFail, rowCallerComplete, usePinStatus, pinUseComplete,
+                            useViolations.Concat(pinViolations)));
                     }
-
-                    if (reference.GraphRegion == null) continue;
-                    var graphLocation = reference.ToJson();
-                    graphLocation["inputAddress"] = point.Address;
-                    graphLocation["inputName"] = point.Name;
-                    graphLocations.Add(graphLocation);
-                    if (!GraphEnabled || excluded || !reference.ConfirmedUsage) continue;
-                    graphFail = true;
-                    Violation("graphDirectUse", "DIRECT_GRAPH_INPUT", $"{site}: direct input use in {reference.GraphRegion}.", reference);
+                    var noPinStatus = CallPinEnabled && !excluded
+                        && (!reference.ConfirmedUsage || !reference.CallPinTraceComplete || reference.Origin != "simaticML")
+                        ? "INCOMPLETE" : "NOT_EVALUATED";
+                    if (AllowedUsages != null && !excluded && pinAssessments.Count == 0 && !coveredNative.Contains(reference))
+                    {
+                        if (reference.Origin == "simaticML" && reference.ConfirmedUsage && reference.NetworkScanComplete
+                            && reference.CallPinTraceComplete)
+                        {
+                            noPinStatus = "FAIL";
+                            pinFail = true;
+                            useViolations.Add(Violation("callPin", "MISSING_PAIRED_CALL_PIN",
+                                $"{site}: this usage has no FB/FC pin connection to match an allowed pair.", reference));
+                        }
+                        else
+                        {
+                            noPinStatus = "INCOMPLETE";
+                            pinComplete = false;
+                            reasons.Add($"{site}: the pin connection for this usage could not be confirmed.");
+                        }
+                    }
+                    assessments.Add(reference, (AssessUse(callerUseFail, callerUseComplete, noPinStatus,
+                        noPinStatus != "INCOMPLETE", useViolations), pinAssessments));
                 }
-                if (CallPinEnabled && !excluded && hasUse && pinComplete && !targetInput)
+                if (CallPinEnabled && !excluded && hasUse && pinComplete && !hasTargetConnection)
                 {
                     pinFail = true;
-                    Violation("callPin", "MISSING_TARGET_INPUT", $"No direct Input or InOut connection was found to {CallBlockType}{CallBlockNumber} {CallBlockName}.");
+                    var message = AllowedUsages == null
+                        ? $"No Input or InOut connection was found to {CallBlockType}{CallBlockNumber} {CallBlockName}."
+                        : "No pin connection matched any allowed caller/callee pair.";
+                    Violation("callPin", "MISSING_TARGET_INPUT", message);
                 }
 
-                var complete = excluded || (usageComplete && (!CommentEnabled || !commentError)
+                var complete = excluded || (usageComplete && (!checkComment || !commentError)
                     && (!BlockEnabled || callerComplete) && (!CallPinEnabled || pinComplete) && (!GraphEnabled || graphComplete));
                 anyIncomplete |= !complete;
                 var callerStatus = RuleStatus(BlockEnabled, callerFail, callerComplete);
                 var pinStatus = RuleStatus(CallPinEnabled, pinFail, pinComplete);
                 var graphStatus = RuleStatus(GraphEnabled, graphFail, graphComplete);
-                var status = excluded ? "EXCLUDED" : callerFail || pinFail || graphFail ? "FAIL" : !complete ? "INCOMPLETE"
-                    : !hasUse ? point.HasSafetyUse ? "SAFETY_ONLY" : "UNUSED" : rulesEnabled ? "PASS" : "NOT_EVALUATED";
+                var status = excluded ? "EXCLUDED" : callerFail || pinFail || graphFail || commentFail ? "FAIL" : !complete ? "INCOMPLETE"
+                    : rulesEnabled || checkComment ? "PASS" : "NOT_EVALUATED";
                 counts[status]++;
                 if (!excluded && hasUse) used++;
                 if (status == "FAIL" && !complete) partial++;
                 if (callerFail) callerFailures++;
                 if (pinFail) pinFailures++;
                 if (graphFail) graphFailures++;
+                if (commentFail) commentFailures++;
                 rows.Add(new JsonObject
                 {
                     ["name"] = point.Name, ["address"] = point.Address, ["coveredAddress"] = point.Span.Canonical,
                     ["table"] = point.Table, ["softwareUnit"] = point.SoftwareUnit, ["comment"] = point.Comment.DeepClone(),
-                    ["references"] = ReportReferences(references, allowedInOut, point.Name),
+                    ["references"] = new JsonArray(references.Where(r => !coveredNative.Contains(r)).Select(reference =>
+                    {
+                        callers.TryGetValue(reference, out var caller);
+                        var result = reference.ToJson(allowedInOut.Contains(reference), caller);
+                        var assessment = assessments[reference];
+                        result["assessment"] = assessment.Use;
+                        var pins = (JsonArray)result["callPins"]!;
+                        for (int i = 0; i < pins.Count; i++) pins[i]!["assessment"] = assessment.Pins[i];
+                        return (JsonNode)result;
+                    }).ToArray()),
                     ["callPinConnections"] = pinConnections, ["graphLocations"] = graphLocations,
-                    ["status"] = status == "SAFETY_ONLY" ? "UNUSED" : status,
-                    ["safetyOnlyExcluded"] = status == "SAFETY_ONLY",
+                    ["status"] = status, ["safetyOnlyExcluded"] = false,
                     ["ruleStatus"] = callerStatus, ["callerRuleStatus"] = callerStatus,
                     ["callPinRuleStatus"] = pinStatus, ["graphDirectUseStatus"] = graphStatus,
                     ["complete"] = complete, ["hasSafetyUse"] = point.HasSafetyUse,
-                    ["commentStatus"] = !CommentEnabled ? "NOT_EVALUATED" : excluded ? "EXCLUDED" : commentError ? "INCOMPLETE" : "PASS",
+                    ["commentStatus"] = commentStatus,
                     ["reasons"] = Strings(violations.Select(v => v!["message"]!.GetValue<string>()).Concat(reasons).Distinct()),
                     ["uncertaintyReasons"] = Strings(reasons.Distinct()), ["violations"] = violations,
                 });
@@ -523,34 +763,38 @@ namespace TiaMcpServer.Siemens
             }
 
             var checkedCount = counts["PASS"] + counts["FAIL"] + counts["INCOMPLETE"] + counts["NOT_EVALUATED"];
-            var allComplete = inventoryComplete && absoluteScanComplete && (!CallPinEnabled || callPinScanComplete)
-                && (!GraphEnabled || graphScanComplete) && !anyIncomplete;
+            var allComplete = inventoryComplete && absoluteScanComplete && graphScanComplete
+                && (!CallPinEnabled || callPinScanComplete) && !anyIncomplete;
             return new JsonObject
             {
                 ["addressRanges"] = Strings(AddressRanges),
                 ["configuration"] = new JsonObject
                 {
                     ["commentFilterEnabled"] = CommentEnabled, ["commentKeywords"] = Strings(Keywords),
-                    ["fbRuleEnabled"] = BlockEnabled, ["requiredBlockType"] = BlockType,
-                    ["requiredBlockNumber"] = BlockNumber, ["requiredLanguage"] = Language,
-                    ["callPinRuleEnabled"] = CallPinEnabled, ["requiredCallBlockType"] = CallBlockType,
-                    ["requiredCallBlockNumber"] = CallBlockNumber, ["requiredCallBlockName"] = CallBlockName,
+                    ["fbRuleEnabled"] = BlockEnabled, ["requiredBlockType"] = AllowedUsages == null ? BlockType : null,
+                    ["requiredBlockNumber"] = AllowedUsages == null ? BlockNumber : (int?)null,
+                    ["requiredLanguage"] = AllowedUsages == null ? Language : null,
+                    ["callPinRuleEnabled"] = CallPinEnabled, ["requiredCallBlockType"] = AllowedUsages == null ? CallBlockType : null,
+                    ["requiredCallBlockNumber"] = AllowedUsages == null ? CallBlockNumber : null,
+                    ["requiredCallBlockName"] = AllowedUsages == null ? CallBlockName : null,
+                    ["allowedUsages"] = AllowedUsages == null ? null : JsonSerializer.SerializeToNode(AllowedUsages),
                     ["graphTransitionRuleEnabled"] = GraphEnabled,
                     ["skipFbNumbers"] = new JsonArray(SkipFbNumbers.OrderBy(n => n).Select(n => (JsonNode)JsonValue.Create(n)!).ToArray()),
                     ["skipFbNames"] = Strings(SkipFbNames.OrderBy(n => n, StringComparer.OrdinalIgnoreCase)),
                 },
                 ["rangeTagCount"] = tags, ["absoluteOnlyCount"] = absoluteOnly, ["excludedCount"] = counts["EXCLUDED"],
-                ["usedCount"] = used, ["unusedCount"] = counts["UNUSED"], ["safetyOnlyExcludedCount"] = counts["SAFETY_ONLY"],
+                ["usedCount"] = used, ["unusedCount"] = counts["UNUSED"], ["safetyOnlyExcludedCount"] = safetyOnlyExcluded,
                 ["checkedInputCount"] = checkedCount, ["passCount"] = counts["PASS"], ["failCount"] = counts["FAIL"],
                 ["unconfirmedCount"] = counts["INCOMPLETE"], ["partiallyUnconfirmedCount"] = partial,
                 ["legacyUnconfirmedCount"] = counts["INCOMPLETE"] + partial, ["notEvaluatedCount"] = counts["NOT_EVALUATED"],
                 ["ruleViolationCounts"] = new JsonObject
                 {
                     ["caller"] = callerFailures, ["callPin"] = pinFailures, ["graphDirectUse"] = graphFailures,
+                    ["comment"] = commentFailures,
                 },
                 ["points"] = rows, ["warnings"] = Strings(warnings), ["complete"] = allComplete,
                 ["overallStatus"] = counts["FAIL"] > 0 ? "FAIL" : !allComplete ? "INCOMPLETE"
-                    : !rulesEnabled ? "NOT_EVALUATED" : checkedCount == 0 ? "UNUSED" : "PASS",
+                    : checkedCount == 0 ? "UNUSED" : counts["PASS"] == 0 ? "NOT_EVALUATED" : "PASS",
             };
         }
 

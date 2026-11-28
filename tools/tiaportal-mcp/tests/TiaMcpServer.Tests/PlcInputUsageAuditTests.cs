@@ -22,14 +22,18 @@ namespace TiaMcpServer.Tests
 
             var excluded = Point("Cyl", "%I0.0", Ref("FB", 82, "LAD", "Write"));
             excluded.Comment["de-DE"] = "ZyLiNdEr";
-            var rows = audit.Summarize(new[] { excluded, Point("Empty", "%I0.1") }, Array.Empty<string>(), true, true);
-            check(Status(Row(rows, "Cyl")) == "EXCLUDED" && Status(Row(rows, "Empty")) == "UNUSED",
-                "I audit: any language, case-insensitive match excludes, empty comment does not");
+            var unusedKeyword = Point("UnusedKeyword", "%I0.2");
+            unusedKeyword.Comment["de-DE"] = "ZyLiNdEr";
+            var rows = audit.Summarize(new[] { excluded, Point("Empty", "%I0.1"), unusedKeyword }, Array.Empty<string>(), true, true);
+            check(Status(Row(rows, "Cyl")) == "EXCLUDED" && rows["points"]!.AsArray().Count == 1
+                && rows["unusedCount"]!.GetValue<int>() == 2 && rows["excludedCount"]!.GetValue<int>() == 1,
+                "I audit: any language, case-insensitive match excludes, confirmed unused is counted without a row");
             check(Status(Row(Report(Audit(comment: false), excluded), "Cyl")) == "FAIL", "I audit: comment switch acts independently");
             var badComment = Point("Comment", "%I0.1", Ref("FB", 81, "LAD", "Read"));
             badComment.Comment["_error"] = "unavailable";
             check(Status(Row(Report(audit, badComment), "Comment")) == "INCOMPLETE", "I audit: failed comment read cannot pass");
-            check(Status(Row(Report(Audit(comment: false), badComment), "Comment")) == "PASS", "I audit: disabled comment rule does not gate a valid block rule");
+            check(Status(Row(Report(Audit(comment: false), badComment), "Comment")) == "INCOMPLETE",
+                "I audit: disabling comment keywords still checks comment readability");
 
             foreach (var access in new[] { "Read", "ReadAndSymbol", "Write", "WriteAndSymbol", "RW", "ReadWriteAndSymbol", "Unknown", "Undefined", "other" })
             {
@@ -47,8 +51,8 @@ namespace TiaMcpServer.Tests
                 check(Status(row) == "FAIL" && row["references"]!.AsArray().Count == 2,
                     $"I audit: any violation among multiple uses ({r.BlockType}{r.BlockNumber} {r.Language})");
                 var disabled = Row(Report(Audit(block: false), p), "Tag");
-                check(Status(disabled) == "NOT_EVALUATED" && disabled["references"]!.AsArray().Count == 2,
-                    "I audit: disabling the block rule returns every use");
+                check(Status(disabled) == "PASS" && disabled["references"]!.AsArray().Count == 2,
+                    "I audit: disabling the block rule returns every use and still checks the comment");
             }
 
             var unit = Point("UnitTag", "%I0.0", Ref("FB", 81, "LAD", "Read"));
@@ -72,17 +76,97 @@ namespace TiaMcpServer.Tests
 
             var large = Enumerable.Range(0, 5101).Select(i => Point($"Tag{i}", $"%I{i}.0"));
             var largeReport = Report(new PlcInputUsageAudit(new[] { "%I0.0..%I5100.7" }, false, null, true, "FB", 81, "LAD"), large.ToArray());
-            check(largeReport["rangeTagCount"]!.GetValue<int>() == 5101 && largeReport["unusedCount"]!.GetValue<int>() == 5101,
+            check(largeReport["rangeTagCount"]!.GetValue<int>() == 5101 && largeReport["unusedCount"]!.GetValue<int>() == 5101
+                && largeReport["checkedInputCount"]!.GetValue<int>() == 0 && largeReport["points"]!.AsArray().Count == 0,
                 "I audit: full inventory above the GetPlcTags result cap");
 
+            CheckUnusedAndComments(check);
             ScanAbsolute(check);
             CheckCallPins(check);
+            CheckContactPins(check);
             CheckReferenceSources(check);
+            CheckAllowedUsages(check);
             CheckGraph(check);
             CheckSafetyAndCounts(check);
             CheckFixedExclusions(check);
             CheckStatementList(check);
             check(ToolSafety.Classify("AuditPlcInputUsage").ReadOnly, "I audit: read-only policy");
+        }
+
+        private static void CheckUnusedAndComments(Action<bool, string> check)
+        {
+            var audit = Audit(block: false, comment: false);
+            var native = Ref("FB", 81, "LAD", "Read");
+            var xml = Ref("FB", 81, "LAD", "Read");
+            xml.Origin = "simaticML";
+            var unused = Point("Unused", "%I0.0");
+            unused.Comment.Clear();
+            var inventoryMissing = audit.Summarize(new[] { unused }, Array.Empty<string>(), false, true);
+            var xmlMissing = audit.Summarize(new[] { unused }, Array.Empty<string>(), true, false);
+            var graphMissing = audit.Summarize(new[] { unused }, Array.Empty<string>(), true, true, graphScanComplete: false);
+            foreach (var report in new[] { inventoryMissing, xmlMissing, graphMissing })
+                check(Status(Row(report, "Unused")) == "INCOMPLETE" && report["unusedCount"]!.GetValue<int>() == 0
+                    && report["checkedInputCount"]!.GetValue<int>() == 1,
+                    "I audit: an incomplete inventory, XML export or GRAPH scan prevents unused exclusion");
+            unused.Comment["_error"] = "unavailable";
+            check(Report(audit, unused)["points"]!.AsArray().Count == 0,
+                "I audit: confirmed unused needs no comment check");
+
+            var ambiguous = Point("Ambiguous", "%I0.1");
+            ambiguous.SymbolScanComplete = false;
+            var potentialUse = Ref("FB", 81, "LAD", "Read");
+            potentialUse.ConfirmedUsage = false;
+            var potential = Point("Potential", "%I0.2", potentialUse);
+            var uncertain = Report(audit, ambiguous, potential);
+            check(uncertain["unconfirmedCount"]!.GetValue<int>() == 2 && uncertain["unusedCount"]!.GetValue<int>() == 0,
+                "I audit: ambiguous symbols and potential references cannot be hidden");
+
+            var nativeOnly = Point("Native", "%I0.3", native);
+            var xmlOnly = Point("XML", "%I0.4", xml);
+            var both = Point("Both", "%I0.5", native, xml);
+            nativeOnly.Comment.Clear();
+            xmlOnly.Comment = new JsonObject { ["zh-CN"] = "   ", ["en-US"] = "" };
+            both.Comment.Clear();
+            both.ReferencesComplete = false;
+            var multilingual = Point("Multilingual", "%I0.6", native);
+            multilingual.Comment = new JsonObject { ["zh-CN"] = "", ["en-US"] = "Input", ["de-DE"] = "Eingang" };
+            var multipleLanguages = Point("MultipleLanguages", "%I1.0", xml);
+            multipleLanguages.Comment = new JsonObject { ["zh-CN"] = "输入", ["en-US"] = "Input" };
+            var unreadable = Point("Unreadable", "%I0.7", native);
+            unreadable.Comment = new JsonObject { ["_error"] = "unavailable" };
+            var checkedPoints = Report(audit, unused, nativeOnly, xmlOnly, both, multilingual, multipleLanguages, unreadable);
+            foreach (var name in new[] { "Native", "XML", "Both" })
+            {
+                var row = Row(checkedPoints, name);
+                var violation = row["violations"]!.AsArray().Single()!;
+                check(Status(row) == "FAIL" && row["commentStatus"]!.ToString() == "FAIL"
+                    && violation["rule"]!.ToString() == "comment" && violation["code"]!.ToString() == "MISSING_INPUT_COMMENT"
+                    && violation["message"]!.ToString() == "I 点缺少注释。" && row["reasons"]!.AsArray().Any(r => r!.ToString() == "I 点缺少注释。"),
+                    $"I audit: confirmed {name} usage fails for missing comments even with all options disabled");
+            }
+            check(Status(Row(checkedPoints, "Multilingual")) == "PASS" && Status(Row(checkedPoints, "MultipleLanguages")) == "PASS"
+                && Status(Row(checkedPoints, "Unreadable")) == "INCOMPLETE" && Row(checkedPoints, "Unreadable")["violations"]!.AsArray().Count == 0
+                && checkedPoints["checkedInputCount"]!.GetValue<int>() == 6 && checkedPoints["unusedCount"]!.GetValue<int>() == 1
+                && checkedPoints["passCount"]!.GetValue<int>() == 2 && checkedPoints["failCount"]!.GetValue<int>() == 3
+                && checkedPoints["unconfirmedCount"]!.GetValue<int>() == 1 && checkedPoints["partiallyUnconfirmedCount"]!.GetValue<int>() == 1
+                && checkedPoints["ruleViolationCounts"]!["comment"]!.GetValue<int>() == 3 && checkedPoints["overallStatus"]!.ToString() == "FAIL",
+                "I audit: multilingual comments, failed reads, comment violations and partial coverage are counted independently");
+
+            var paths = new[] { "Inputs", "Sensors/Inputs", "Other/Inputs", "Software units/UnitA/Sensors/Inputs" };
+            var named = paths.Select(path =>
+            {
+                var tag = Point("SameName", "%I1.0", native);
+                tag.Table = path;
+                tag.Comment.Clear();
+                return tag;
+            });
+            var absolute = new PlcInputAuditPoint { Address = "%I1.1", Span = Span("%I1.1") };
+            absolute.References.Add(xml);
+            var tables = Report(audit, named.Append(absolute).ToArray())["points"]!.AsArray();
+            check(tables.Take(4).Select(p => p!["table"]!.ToString()).SequenceEqual(paths)
+                && tables.Take(4).All(p => Status(p!) == "FAIL")
+                && tables[4]!["table"] == null && Status(tables[4]!) == "NOT_EVALUATED",
+                "I audit: failed tags return the exact table path, including duplicate table names and software units");
         }
 
         private static void CheckCallPins(Action<bool, string> check)
@@ -238,6 +322,100 @@ namespace TiaMcpServer.Tests
                 "I audit: use callee interface to distinguish SCL InOut from Input when the parameter carries no Section");
         }
 
+        private static void CheckContactPins(Action<bool, string> check)
+        {
+            const string operand = """<Access Scope="GlobalVariable" UId="21"><Symbol><Component Name="Tag"/></Symbol></Access>""";
+            string Part(int uid, string name, string detail = "") => $"""<Part Name="{name}" UId="{uid}">{detail}</Part>""";
+            string Name(int uid, string pin) => $"""<NameCon UId="{uid}" Name="{pin}"/>""";
+            string Wire(params string[] ports) => "<Wire>" + string.Concat(ports) + "</Wire>";
+            string Call(int uid, string type) => $"""
+                <Call UId="{uid}"><CallInfo Name="Target" BlockType="{type}">
+                  <Parameter Name="init" Section="Input" Type="Bool"/>
+                  <Parameter Name="exchange" Section="InOut" Type="Bool"/>
+                  <Parameter Name="out" Section="Output" Type="Bool"/>
+                  <Parameter Name="return" Section="Return" Type="Bool"/>
+                </CallInfo></Call>
+                """;
+            PlcInputXmlUse ScanContact(string parts, params string[] wires)
+            {
+                var body = """<FlgNet xmlns="http://www.siemens.com/automation/Openness/SW/NetworkSource/FlgNet/v5">"""
+                    + "<Parts>" + operand + parts + "</Parts><Wires>"
+                    + Wire("""<IdentCon UId="21"/>""", Name(24, "operand")) + string.Concat(wires) + "</Wires></FlgNet>";
+                return PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit(body) + "</Document>"), new List<string>()).Single();
+            }
+            JsonObject Assess(PlcInputXmlUse use, PlcInputUsageAudit audit)
+            {
+                var reference = Ref("FB", 81, "LAD", use.Access);
+                reference.Origin = "simaticML";
+                reference.NetworkScanComplete = use.NetworkScanComplete;
+                reference.CallPinTraceComplete = use.CallPinTraceComplete;
+                reference.ConfirmedUsage = use.Confirmed;
+                foreach (var pin in use.Pins)
+                {
+                    pin.BlockNumber = pin.BlockType == "FB" ? 82 : 7;
+                    reference.CallPins.Add(pin);
+                }
+                return Report(audit, Point("Tag", "%I0.0", reference));
+            }
+
+            var normal = Part(24, "Contact");
+            var negated = Part(24, "Contact", """<Negated Name="operand"/>""");
+            foreach (var type in new[] { "FB", "FC" })
+            foreach (var (part, source) in new[] { (normal, PlcInputPinSource.Contact), (negated, PlcInputPinSource.NegatedContact),
+                (Part(24, "NegatedContact"), PlcInputPinSource.NegatedContact) })
+            foreach (var (pin, direction) in new[] { ("init", "Input"), ("exchange", "InOut") })
+            {
+                var use = ScanContact(part + Call(25, type), Wire("<Powerrail/>", Name(24, "in")), Wire(Name(24, "out"), Name(25, pin)));
+                var row = Row(Assess(use, AuditRules(type, type == "FB" ? 82 : 7, "Target", caller: true)), "Tag");
+                check(use.Confirmed && use.CallPinTraceComplete && use.Access == "Read"
+                    && use.Pins.Single().Source == source && use.Pins.Single().Direction == direction
+                    && Status(row) == "PASS" && row["callerRuleStatus"]!.ToString() == "PASS",
+                    $"I audit: LAD {source} to {type} {direction} keeps the operand read-only");
+            }
+
+            var audit = AuditRules("FB", 82, "Target", caller: true);
+            var branch = ScanContact(negated + Part(26, "Contact") + Call(25, "FB") + Call(27, "FB") + Call(28, "FC"),
+                Wire(Name(24, "out"), Name(25, "init"), Name(26, "in")),
+                Wire(Name(26, "out"), Name(27, "exchange")), Wire("<Powerrail/>", Name(28, "init")));
+            check(branch.Pins.Select(p => (p.CallUid, p.Pin)).OrderBy(p => p.CallUid)
+                    .SequenceEqual(new (string?, string?)[] { ("25", "init"), ("27", "exchange") })
+                && branch.Pins.All(p => p.Source == PlcInputPinSource.NegatedContact)
+                && Status(Row(Assess(branch, audit), "Tag")) == "PASS",
+                "I audit: follow a contact-only series and fan-out without claiming an unrelated call");
+            check(Status(Row(Assess(branch, AuditRules("FC", 7, "Target")), "Tag")) == "FAIL",
+                "I audit: traced calls still have to match the configured target");
+
+            var wrongDirection = ScanContact(normal + Call(25, "FB"), Wire(Name(24, "out"), Name(25, "out"), Name(25, "return")));
+            var wrongRow = Row(Assess(wrongDirection, audit), "Tag");
+            check(wrongDirection.Access == "Read" && wrongRow["callerRuleStatus"]!.ToString() == "PASS"
+                && wrongRow["violations"]!.AsArray().Count(v => v!["code"]!.ToString() == "OUTPUT_OR_RETURN") == 2,
+                "I audit: contacts reaching Output or Return fail pins while retaining Read access");
+
+            var throughLogic = ScanContact(normal + Part(26, "O") + Call(25, "FB"),
+                Wire(Name(24, "out"), Name(26, "in1")), Wire(Name(26, "out"), Name(25, "init")));
+            var unconnected = ScanContact(normal + Call(25, "FB"), Wire("<Powerrail/>", Name(25, "en")));
+            var enableOnly = ScanContact(normal + Call(25, "FB"), Wire(Name(24, "out"), Name(25, "en")));
+            var edgeContact = ScanContact(Part(24, "PContact") + Call(25, "FB"), Wire(Name(24, "out"), Name(25, "init")));
+            foreach (var use in new[] { throughLogic, unconnected, enableOnly, edgeContact })
+                check(use.Pins.Count == 0 && Status(Row(Assess(use, audit), "Tag")) == "FAIL",
+                    "I audit: known non-contact logic, unconnected outputs, control port or edge parts give no qualifying pin");
+
+            var missing = ScanContact(Call(25, "FB"), Wire(Name(24, "out"), Name(25, "init")));
+            var unresolved = ScanContact(normal + Call(25, "FB"), Wire(Name(24, "out"), Name(99, "in"), Name(25, "init")));
+            var merged = ScanContact(normal + Part(26, "Contact") + Call(25, "FB"),
+                Wire(Name(24, "out"), Name(26, "out"), Name(25, "init")));
+            var unknownPort = ScanContact(normal + Part(26, "TON") + Call(25, "FB"),
+                Wire(Name(24, "out"), Name(26, "Q"), Name(25, "init")));
+            foreach (var use in new[] { missing, unresolved, merged, unknownPort })
+                check(use.Pins.Count == 0 && Status(Row(Assess(use, audit), "Tag")) == "INCOMPLETE",
+                    "I audit: unresolved part UIDs and multiple output drivers stay incomplete");
+            var mixedDrivers = ScanContact(normal + Call(25, "FB") + Call(26, "FC"),
+                Wire(Name(24, "out"), Name(25, "init"), Name(26, "out")));
+            check(!mixedDrivers.CallPinTraceComplete && mixedDrivers.Pins.Single().Direction == "Output"
+                && Status(Row(Assess(mixedDrivers, audit), "Tag")) == "FAIL",
+                "I audit: a call output on the same wire remains a violation and does not prove a contact connection to another input");
+        }
+
         private static void CheckGraph(Action<bool, string> check)
         {
             const string operand = """<Access UId="1" Scope="Address"><Address Area="Input" Type="Bool" BitOffset="0"/></Access>""";
@@ -259,7 +437,8 @@ namespace TiaMcpServer.Tests
             var direct = uses.Where(u => u.Absolute || u.Symbol!.Single() == "DirectInput").ToList();
             check(issues.Count == 0 && direct.Select(u => u.GraphRegion).SequenceEqual(new[]
                 { "PermanentPreInstructions", "PermanentPostInstructions", "Transition", null })
-                && direct[1].Pins.Single().Direction == "Input" && direct[2].TransitionNumber == 42,
+                && direct[1].Pins.Single().Direction == "Input" && direct[1].GraphOperationNumber == 1
+                && direct[2].TransitionNumber == 42,
                 "I audit: V20 GRAPH regions and call operands, exclude indirect intermediate and step action from GRAPH violations");
             var point = Point("DirectInput", "%I0.0", direct.Select(u =>
             {
@@ -272,6 +451,9 @@ namespace TiaMcpServer.Tests
             var graphAudit = AuditRules(null, null, null, pins: false, graph: true);
             var row = Row(Report(graphAudit, point), "DirectInput");
             check(Status(row) == "FAIL" && row["graphLocations"]!.AsArray().Count == 3, "I audit: GRAPH returns three positions for one input");
+            check(row["violations"]!.AsArray().Select(v => v!["graphRegion"]!.ToString()).SequenceEqual(
+                new[] { "PermanentPreInstructions", "PermanentPostInstructions", "Transition" }),
+                "I audit: GRAPH violations identify each region individually");
             check(Status(Row(Report(graphAudit, Point("Step", "%I0.1", point.References.Last())), "Step")) == "PASS",
                 "I audit: step use is outside GRAPH rule");
             check(Status(Row(Report(graphAudit, Point("NoGraph", "%I0.0", Ref("FB", 81, "LAD", "Read"))), "NoGraph")) == "PASS",
@@ -280,6 +462,23 @@ namespace TiaMcpServer.Tests
             var broken = PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit(brokenGraph) + "</Document>"), issues);
             check(issues.Count != 0 && broken.Any(u => u.GraphRegion == "PermanentPostInstructions"),
                 "I audit: malformed GRAPH region is reported without losing other positions");
+            const string indexed = """<Access Scope="GlobalVariable" UId="1"><Symbol><Component Name="Values" AccessModifier="Array"><Access Scope="GlobalVariable"><Symbol><Component Name="IndexInput"/></Symbol></Access></Component></Symbol></Access>""";
+            var indexedNet = Net(indexed, call, "in");
+            var indexedGraph = graph.Replace(Net(symbol, contact, "operand"), indexedNet);
+            issues.Clear();
+            var indexedUses = PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit(indexedGraph) + "</Document>"), issues);
+            var index = indexedUses.Single(u => u.Symbol?.Single() == "IndexInput");
+            check(issues.Count == 0 && index.Confirmed && index.AccessComplete && index.Access == "Read"
+                && index.GraphRegion == "Transition" && index.TransitionNumber == 42 && index.Pins.Count == 0
+                && indexedUses.Single(u => u.Symbol?.Single() == "Values").Pins.Single().Direction == "Input",
+                "I audit: a V20 GRAPH array index shares its enclosing operand's wire without inheriting the call pin");
+            var unwired = indexedGraph.Replace(indexedNet, indexedNet.Replace("NameCon UId=\"2\"", "NameCon UId=\"8\""));
+            issues.Clear();
+            var unverifiedIndex = PlcInputSimaticMl.Scan(XDocument.Parse("<Document>" + Unit(unwired) + "</Document>"), issues)
+                .Single(u => u.Symbol?.Single() == "IndexInput");
+            check(issues.Count != 0 && !unverifiedIndex.Confirmed && !unverifiedIndex.AccessComplete,
+                "I audit: an array index with no verified enclosing wire remains incomplete");
+
             var partial = graphAudit.Summarize(new[] { point }, issues, true, true, graphScanComplete: false);
             check(Status(Row(partial, "DirectInput")) == "FAIL" && !partial["complete"]!.GetValue<bool>(),
                 "I audit: keep GRAPH violation with partial coverage");
@@ -308,8 +507,8 @@ namespace TiaMcpServer.Tests
             check(report["checkedInputCount"]!.GetValue<int>() == 2 && report["failCount"]!.GetValue<int>() == 1
                 && report["unconfirmedCount"]!.GetValue<int>() == 1 && report["safetyOnlyExcludedCount"]!.GetValue<int>() == 1
                 && report["ruleViolationCounts"]!["caller"]!.GetValue<int>() == 1 && report["ruleViolationCounts"]!["graphDirectUse"]!.GetValue<int>() == 1
-                && Row(report, "SafetyOnly")["complete"]!.GetValue<bool>() && Row(report, "SafetyOnly")["safetyOnlyExcluded"]!.GetValue<bool>()
-                && Status(Row(report, "SafetyOnly")) == "UNUSED", "I audit: exclusive safety-only count with the legacy row status");
+                && report["unusedCount"]!.GetValue<int>() == 1 && report["points"]!.AsArray().Count == 2,
+                "I audit: safety-only points count as unused and have no row");
             used.ReferencesComplete = false;
             report = Report(audit, used);
             check(report["failCount"]!.GetValue<int>() == 1 && report["unconfirmedCount"]!.GetValue<int>() == 0
@@ -318,8 +517,8 @@ namespace TiaMcpServer.Tests
             report = AuditRules(null, null, null, pins: false).Summarize(new[] { only }, Array.Empty<string>(), false, true);
             check(Status(Row(report, "SafetyOnly")) == "INCOMPLETE", "I audit: unclassified inventory precludes a safety-only conclusion");
             report = Report(AuditRules(null, null, null, pins: false), Point("Used", "%I0.0", Ref("FB", 81, "LAD", "Read")));
-            check(report["notEvaluatedCount"]!.GetValue<int>() == 1 && report["passCount"]!.GetValue<int>() == 0,
-                "I audit: all usage rules disabled");
+            check(report["passCount"]!.GetValue<int>() == 1 && report["notEvaluatedCount"]!.GetValue<int>() == 0,
+                "I audit: a used tag with comments passes even with all optional rules disabled");
             var skipAudit = new PlcInputUsageAudit(new[] { "%I0.0" }, false, null, false, "FB", 81, "LAD",
                 skipFbNumbers: new[] { 8, 81 }, skipFbNames: new[] { "Named FB", "AnotherFB" });
             check(skipAudit.SkipBlock("FB", 81, "Different") && skipAudit.SkipBlock("FB", 900, "named fb")
@@ -359,7 +558,8 @@ namespace TiaMcpServer.Tests
             PlcInputUsageAudit.AddNativeProgramUse(mixed, Ref("FB", 81, "LAD", "Read"), PlcInputProgramKind.Standard, false);
             PlcInputUsageAudit.AddNativeProgramUse(unknown, excludedUse, PlcInputProgramKind.Unknown, false);
             var report = Report(Audit(), filtered, mixed, unknown);
-            check(Status(Row(report, "Filtered")) == "UNUSED" && filtered.ReferencesComplete && filtered.ReferenceIssues.Count == 0
+            check(report["unusedCount"]!.GetValue<int>() == 1 && report["points"]!.AsArray().Count == 2
+                && filtered.ReferencesComplete && filtered.ReferenceIssues.Count == 0
                 && Status(Row(report, "Mixed")) == "PASS" && mixed.References.Count == 1 && mixed.ReferencesComplete
                 && Status(Row(report, "Unknown")) == "INCOMPLETE" && unknown.ReferenceIssues.Count == 1
                 && report["checkedInputCount"]!.GetValue<int>() == 2,
@@ -536,6 +736,84 @@ namespace TiaMcpServer.Tests
             row = Row(Report(audit, Point("Tag", "%I0.0", native, first, ParsedPin("NW23/2", "input2"), otherNetwork, differentSymbol)), "Tag");
             check(row["references"]!.AsArray().Count == 4 && row["callPinConnections"]!.AsArray().Count == 2,
                 "I audit: preserve distinct XML pins, networks and symbols");
+
+            first.CallPins.Add(new PlcInputCallPin { BlockType = "FC", BlockNumber = 7, BlockName = "Other", Pin = "out", Direction = "Output" });
+            row = Row(Report(audit, Point("Tag", "%I0.0", native, first)), "Tag");
+            var pins = row["references"]!.AsArray().Single()!["callPins"]!.AsArray();
+            check(Status(row) == "FAIL" && Status(pins[0]!["assessment"]!) == "PASS" && Status(pins[1]!["assessment"]!) == "FAIL"
+                && pins[1]!["assessment"]!["violations"]!.AsArray().Count == 2,
+                "I audit: independent pin outcomes and reasons for simultaneously wrong target and direction");
+
+            var nativeGraph = Ref("FC", 7, "GRAPH", "Read");
+            nativeGraph.Location = "@Caller ▶ 后永久指令 2 (废钉落料记忆)";
+            var graphUse = Ref("FC", 7, "GRAPH", "Read");
+            graphUse.Origin = "simaticML";
+            graphUse.Network = 1;
+            graphUse.NetworkScanComplete = true;
+            graphUse.Location = "NW1/PermanentPostInstructions2/NW1/1";
+            graphUse.GraphRegion = "PermanentPostInstructions";
+            graphUse.GraphOperationNumber = 2;
+            graphUse.SymbolComponents = new[] { "Tag" };
+            row = Row(Report(AuditRules(null, null, null, pins: false, graph: true, caller: true),
+                Point("Tag", "%I0.0", nativeGraph, graphUse)), "Tag");
+            reference = row["references"]!.AsArray().Single()!;
+            check(reference["callerOrigin"]!.ToString() == "crossReference" && reference["network"]!.GetValue<int>() == 1
+                && reference["assessment"]!["violations"]!.AsArray().Where(v => v!["code"]!.ToString() == "WRONG_CALLER")
+                    .Select(v => v!["field"]!.ToString()).SequenceEqual(new[] { "blockType", "blockNumber", "language" }),
+                "I audit: fill a GRAPH native position from the matching operation and report separate caller differences");
+            graphUse.GraphOperationNumber = 3;
+            row = Row(Report(audit, Point("Tag", "%I0.0", nativeGraph, graphUse)), "Tag");
+            check(row["references"]!.AsArray().Count == 2, "I audit: retain native GRAPH positions without an exact operation match");
+        }
+
+        private static void CheckAllowedUsages(Action<bool, string> check)
+        {
+            PlcInputUsageAudit WithPairs(params PlcInputAllowedUsage[] pairs)
+                => new PlcInputUsageAudit(new[] { "%I0.0" }, false, null, false, "", 0, "", allowedUsages: pairs);
+            var firstPair = new PlcInputAllowedUsage
+            {
+                FbReadOnly = new PlcInputAuditCallerRule { Enabled = true, TargetBlockType = "FB", TargetBlockNumber = 81, TargetLanguage = "LAD" },
+                CallPinTarget = new PlcInputAuditPinRule { Enabled = true, TargetBlockType = "FB", TargetBlockNumber = 20 },
+            };
+            var secondPair = new PlcInputAllowedUsage
+            {
+                FbReadOnly = new PlcInputAuditCallerRule { Enabled = false, TargetBlockType = "FC", TargetBlockNumber = 82, TargetLanguage = "SCL" },
+                CallPinTarget = new PlcInputAuditPinRule { Enabled = false, TargetBlockType = "FC", TargetBlockName = "Target" },
+            };
+            var audit = WithPairs(firstPair, secondPair);
+            PlcInputAuditReference Use(string type, int number, string language, string access, PlcInputCallPin? pin = null)
+            {
+                var reference = Ref(type, number, language, access);
+                reference.Origin = "simaticML";
+                reference.NetworkScanComplete = true;
+                if (pin != null) reference.CallPins.Add(pin);
+                return reference;
+            }
+            var byNumber = new PlcInputCallPin { BlockType = "FB", BlockNumber = 20, BlockName = "AnyName", Pin = "In", Direction = "Input" };
+            var byName = new PlcInputCallPin { BlockType = "FC", BlockNumber = 30, BlockName = "target", Pin = "Out", Direction = "Output" };
+            var first = Use("FB", 81, "LAD", "Read", byNumber);
+            var second = Use("FC", 82, "SCL", "Write", byName);
+            var row = Row(Report(audit, Point("Tag", "%I0.0", first, second)), "Tag");
+            check(Status(row) == "PASS" && row["references"]!.AsArray().All(r => Status(r!["callPins"]![0]!["assessment"]!) == "PASS"),
+                "I audit: each row may match a different allowed pair by number or name with its own enabled flags");
+
+            var crossPair = Use("FB", 81, "LAD", "Write", byName);
+            crossPair.Location = "NW2";
+            var withoutPin = Use("FB", 81, "LAD", "Read");
+            withoutPin.Location = "NW3";
+            row = Row(Report(audit, Point("Tag", "%I0.0", first, crossPair, withoutPin)), "Tag");
+            check(Status(row) == "FAIL" && Status(row["references"]![0]!["callPins"]![0]!["assessment"]!) == "PASS"
+                && row["violations"]!.AsArray().Select(v => v!["code"]!.ToString()).SequenceEqual(new[] { "WRONG_CALL_PAIR", "MISSING_PAIRED_CALL_PIN" }),
+                "I audit: reject cross-pair and missing-link rows individually even if another row qualifies");
+
+            var restrictAccess = new PlcInputAllowedUsage
+            {
+                FbReadOnly = new PlcInputAuditCallerRule { Enabled = true, TargetBlockType = "FC", TargetBlockNumber = 82, TargetLanguage = "SCL" },
+                CallPinTarget = secondPair.CallPinTarget,
+            };
+            secondPair.CallPinTarget = new PlcInputAuditPinRule { Enabled = true, TargetBlockType = "FC", TargetBlockName = "Target" };
+            row = Row(Report(WithPairs(restrictAccess, secondPair), Point("Tag", "%I0.0", second)), "Tag");
+            check(Status(row) == "FAIL", "I audit: access and pin direction must satisfy the same allowed pair");
         }
 
         private static string Unit(string body)
@@ -551,6 +829,7 @@ namespace TiaMcpServer.Tests
         private static PlcInputAuditPoint Point(string name, string address, params PlcInputAuditReference[] references)
         {
             var point = new PlcInputAuditPoint { Name = name, Table = "Inputs", Address = address, Span = Span(address) };
+            point.Comment["en-US"] = "Input signal";
             point.References.AddRange(references);
             return point;
         }

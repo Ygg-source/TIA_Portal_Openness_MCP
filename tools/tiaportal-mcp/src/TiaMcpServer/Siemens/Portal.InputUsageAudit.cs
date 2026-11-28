@@ -267,14 +267,25 @@ namespace TiaMcpServer.Siemens
             var skippedCallees = blocks.Where(p => p.Value.Skipped).ToDictionary(p => p.Value, p => p.Key);
             var interfaceReads = new HashSet<InputAuditBlock>();
 
+            void RecordUnreadableBlock(InputAuditBlock metadata, bool exported, Exception ex)
+            {
+                var unreadable = metadata.IdentityJson();
+                unreadable["failureStage"] = exported ? "scan" : "export";
+                unreadable["reason"] = ex.Message;
+                unreadable["reasonCode"] = ExportErrorContext.Build("export", "plcBlock", softwarePath, metadata.Path, ex)["reason"]?.GetValue<string>();
+                unreadableBlocks.Add(unreadable);
+            }
+
             ILookup<string, string>? ReadSkippedInterface(InputAuditBlock metadata)
             {
                 if (!skippedCallees.TryGetValue(metadata, out var block) || !interfaceReads.Add(metadata))
                     return metadata.PinDirections;
+                var exported = false;
                 try
                 {
                     skippedInterfaceExportAttempts++;
                     block.Export(file, ExportOptions.None);
+                    exported = true;
                     using var xml = XmlReader.Create(file.FullName);
                     if (xml.ReadToFollowing("Interface"))
                     {
@@ -284,6 +295,7 @@ namespace TiaMcpServer.Siemens
                 }
                 catch (Exception ex) when (!PortalFailureClassifier.IsPortalProcessLost(ex))
                 {
+                    RecordUnreadableBlock(metadata, exported, ex);
                     warnings.Add($"{metadata.Path}: skipped callee interface could not be read: {ex.Message}");
                 }
                 finally
@@ -300,11 +312,13 @@ namespace TiaMcpServer.Siemens
                 {
                     var path = metadata.Path;
                     var graph = metadata.Language == "GRAPH";
+                    var exported = false;
                     try
                     {
                         xmlExportAttempts++;
                         if (metadata.Kind == PlcInputProgramKind.Safety) safetyXmlExportAttempts++;
                         block.Export(file, ExportOptions.None);
+                        exported = true;
                         var issues = new List<string>();
                         var graphIssues = new List<string>();
                         var xml = XDocument.Load(file.FullName);
@@ -387,11 +401,12 @@ namespace TiaMcpServer.Siemens
                                 Access = access, Location = match.Site, Network = match.Network,
                                 AccessComplete = match.AccessComplete || match.Access == "Unknown" && access != "Unknown",
                                 HasOtherWrite = match.HasOtherWrite, NetworkScanComplete = match.NetworkScanComplete,
+                                CallPinTraceComplete = match.CallPinTraceComplete,
                                 Address = match.Absolute ? match.Span.Canonical : null,
                                 Symbol = match.Symbol == null ? null : string.Join(".", match.Symbol),
                                 SymbolComponents = match.Symbol,
                                 Origin = "simaticML", Absolute = match.Absolute, ConfirmedUsage = match.Confirmed,
-                                GraphRegion = match.GraphRegion, GraphSequence = match.GraphSequence,
+                                GraphRegion = match.GraphRegion, GraphSequence = match.GraphSequence, GraphOperationNumber = match.GraphOperationNumber,
                                 TransitionName = match.TransitionName, TransitionNumber = match.TransitionNumber,
                             };
                             if (match.Pins.Count != 0)
@@ -405,9 +420,7 @@ namespace TiaMcpServer.Siemens
                     catch (Exception ex) when (!PortalFailureClassifier.IsPortalProcessLost(ex))
                     {
                         xmlFailures++;
-                        var unreadable = metadata.IdentityJson();
-                        unreadable["reason"] = ex.Message;
-                        unreadableBlocks.Add(unreadable);
+                        RecordUnreadableBlock(metadata, exported, ex);
                         if (graph) graphFailures++;
                         warnings.Add($"{path}: block XML could not be scanned: {ex.Message}");
                     }
